@@ -1,0 +1,10 @@
+streamlit==1.45.0
+pillow==11.2.1
+imagehash==4.3.1
+numpy==2.2.6
+scipy==1.15.2
+PyWavelets==1.8.0
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.6
+tomli-w==1.1.0
+# pillow-heif==0.21.0   # опционально: поддержка HEIC/HEIF — раскомментируйте и пересоберите образ

@@ -1,0 +1,13 @@
+.my_readme.md
+.tmp/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+# рабочие каталоги архива и локальные настройки
+src/
+trash/
+settings.toml
+*.zip

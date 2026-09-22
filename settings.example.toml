@@ -1,0 +1,33 @@
+# Настройки Photo Dedup.
+# Скопируйте в settings.toml и правьте: cp settings.example.toml settings.toml
+# Приоритет: CLI-флаги > settings.toml > встроенные дефолты.
+# ВНИМАНИЕ: сохранение из веб-UI перезаписывает файл БЕЗ комментариев.
+
+[paths]
+src = "/data/src"       # архив с фотографиями (в docker — маунт ./src)
+trash = "/data/trash"   # куда переносятся дубликаты (в docker — маунт ./trash)
+                        # trash НЕ должен находиться внутри src (валидация при старте движка)
+
+[scan]
+extensions = [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"]
+recursive = true          # обходить вложенные подпапки
+threads = 8               # потоки хэширования (ThreadPoolExecutor)
+batch_size = 200          # размер батча записи в БД (одна транзакция)
+
+[hash]
+method = "phash"          # imagehash.phash
+hash_size = 8             # 64-битный хэш (8x8 бит)
+hash_part_len = 4         # символов hex для бакета (4 = 16 бит = ~1/65536)
+
+[analyze]
+threshold = 4             # макс. расстояние Хэмминга для пары кандидатов
+
+[move]
+mode = "auto"             # auto | manual; manual — только подтверждённые группы
+keep_by = "size"          # size | pixels — что считать «оригиналом»
+conflict = "suffix"       # коллизии имён внутри group_{id}: суффикс _1, _2…
+dry_run = false           # true — только фиксировать план, физически не переносить
+
+[ui]
+page_size = 15            # групп на страницу галереи
+refresh_sec = 2           # интервал автообновления фрагментов монитора/журнала

@@ -1,0 +1,14 @@
+# В образ попадает только код и манифесты
+.git
+.gitignore
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+src/
+trash/
+settings.toml
+*.zip
+*.md
+.env
