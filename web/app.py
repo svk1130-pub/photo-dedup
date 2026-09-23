@@ -1,12 +1,19 @@
-"""Streamlit UI — тонкий монитор и пульт.
+"""Streamlit UI — монитор и пульт.
 
-Запрещено by design: обработка изображений (кроме ленивых миниатюр из
-web/thumbs.py), обходы файловой системы, запросы без LIMIT. Соединения —
-только из пула (st.cache_resource, max 5). UI никогда не запускает движок
-как subprocess — только читает БД и пишет флаги/команды:
-  * stop_requested (кнопка Стоп),
-  * groups.confirmed (подтверждение переноса в manual-режиме),
-  * settings.toml (через отдельный rw-маунт).
+Архитектурная линия: UI не делает тяжёлой работы — обработка изображений
+(кроме ленивых миниатюр web/thumbs.py), обходы ФС и запросы без LIMIT запрещены;
+соединения — только из пула (st.cache_resource, max 5).
+
+ИСКЛЮЧЕНИЯ 1.4.0 (по прямому запросу пользователя, точечные):
+  * кнопки «Монитора» запускают движок как subprocess ВНУТРИ web-контейнера
+    (`python -m engine.cli run|scan`): буквально `docker compose run` из UI
+    потребовал бы проброса docker.sock (root-доступ к хосту) и docker CLI в образе;
+  * web/actions.py — возврат/удаление ОДНОГО файла из trash по кнопке в галерее
+    (rw-доступ к src/trash; групповые операции по-прежнему только у движка).
+
+Как и раньше, UI управляет движком флагами в БД: stop_requested (🛑 Стоп —
+работает и для subprocess-движка: он опрашивает флаг), groups.confirmed
+(подтверждение переноса в manual-режиме), settings.toml (rw-маунт).
 
 Цель теста: реран UI < 300 мс при полностью загруженном движке — метрика
 «UI rerun, ms» в сайдбаре; тяжёлые вкладки обновляются через st.fragment.
@@ -14,7 +21,9 @@ web/thumbs.py), обходы файловой системы, запросы б�
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -29,7 +38,11 @@ if str(_ROOT) not in sys.path:  # чтобы `import engine` работал пр
 from engine.settings import (  # noqa: E402
     Settings,
     SettingsError,
+    check_paths,
+    container_to_host,
     load_settings,
+    path_map,
+    resolve_paths,
     settings_to_dict,
     update_settings_file,
 )
@@ -136,6 +149,108 @@ def _load_settings_quiet() -> Settings | None:
         return None
 
 
+# ----------------------------- запуск движка из UI (1.4.0) -----------------------------
+
+@st.cache_resource(show_spinner=False)
+def _engine_procs() -> dict[str, subprocess.Popen]:
+    """Реестр запущенных из UI процессов движка: {cmd: Popen}.
+
+    ОБЯЗАТЕЛЬНО cache_resource, а не module-global: streamlit исполняет скрипт
+    заново при каждом реране — обычная глобальная переменная сбрасывалась бы,
+    и защита от двойного запуска не работала. cache_resource — один общий dict
+    для всех сессий на всё время жизни web-процесса."""
+    return {}
+
+
+def _engine_log_path() -> Path:
+    """Лог subprocess-движка: рядом с кэшем миниатюр (web-том), иначе — tmp."""
+    base = Path(os.environ.get("THUMBS_DIR", "/data/cache/thumbs")).parent
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        probe = base / ".probe"
+        probe.write_text("")
+        probe.unlink()
+    except OSError:
+        base = Path(tempfile.gettempdir())
+    return base / "engine-sub.log"
+
+
+def _engine_log_tail(limit_bytes: int = 6000) -> str:
+    try:
+        return _engine_log_path().read_bytes()[-limit_bytes:].decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _spawned_alive() -> list[tuple[str, subprocess.Popen]]:
+    return [(cmd, p) for cmd, p in _engine_procs().items() if p.poll() is None]
+
+
+def _spawn_engine(cmd: str, *, working: bool) -> None:
+    """Запустить `python -m engine.cli <cmd>` как дочерний процесс web-контейнера.
+
+    Эквивалент `docker compose run --rm engine <cmd>` по эффекту: тот же образ,
+    env (PG_DSN, SETTINGS_PATH, PATH_MAP_*) и маунты — но без docker.sock в web.
+    Статус/журнал/🛑 Стоп работают как обычно: движок пишет progress и флаги в БД.
+    """
+    if working:
+        st.error("Движок уже работает (см. статус выше). Дождитесь завершения или нажмите 🛑 Стоп.")
+        return
+    if alive := _spawned_alive():
+        st.error("Из UI уже запущено: " + ", ".join(f"engine {c} (pid {p.pid})" for c, p in alive))
+        return
+    log_path = _engine_log_path()
+    try:
+        fh = open(log_path, "wb")  # лог каждого запуска — с чистого листа
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "engine.cli", cmd],
+                cwd=str(_ROOT),
+                stdout=fh,
+                stderr=subprocess.STDOUT,
+            )
+        finally:
+            fh.close()
+    except OSError as e:
+        st.error(f"Не удалось запустить движок: {e}")
+        return
+    _engine_procs()[cmd] = proc
+    st.toast(f"Движок запущен: engine {cmd} (pid {proc.pid}). Журнал — вкладка «📜 Журнал».", icon="🚀")
+    st.rerun()
+
+
+def _wipe_results() -> None:
+    """«Очистить все»: результаты прогонов + журнал. Файлы на диске не затрагиваются."""
+    from engine import db as engine_db  # лениво: тяжёлый импорт не нужен при старте UI
+
+    try:
+        with get_pool().connection() as conn:
+            engine_db.wipe_results(conn)
+        st.toast("БД очищена: индекс, группы, журнал. Файлы на диске не тронуты.", icon="💥")
+    except Exception as e:
+        st.error(f"Не удалось очистить БД: {type(e).__name__}: {e}")
+    st.rerun()
+
+
+def _clear_events() -> None:
+    try:
+        q("DELETE FROM events", fetch=False)
+        st.toast("Журнал очищен", icon="🧹")
+    except Exception as e:
+        st.error(f"Не удалось очистить журнал: {type(e).__name__}: {e}")
+    st.rerun(scope="fragment")
+
+
+def _confirm_or(flag: str, enabled: bool, run: Any) -> None:
+    """Двухшаговое подтверждение для фрагментов (внутри st.fragment диалоги
+    ненадёжны): первый клик ставит флаг, повторный — выполняет действие."""
+    if not enabled:
+        run()
+        return
+    st.session_state[flag] = True
+    st.rerun(scope="fragment")
+
+
 # ----------------------------- баннер и сайдбар -----------------------------
 
 def _banner(row: dict | None) -> None:
@@ -149,6 +264,7 @@ def _banner(row: dict | None) -> None:
             f"Просмотр прошлых результатов полностью доступен. Запуск:"
         )
         st.code("# в каталоге проекта\ndocker compose run --rm engine run", language="bash")
+        st.caption("…или кнопками «▶️ Запустить run» / «🔍 Запустить scan» на вкладке «🖥 Монитор».")
     elif row["stop_requested"]:
         st.info("🛑 Выставлен флаг остановки — движок завершит текущий файл/батч и остановится.")
 
@@ -157,10 +273,16 @@ def _sidebar(settings: Settings, row: dict | None) -> None:
     with st.sidebar:
         st.header("🖼 Photo Dedup")
         p = settings.paths
-        for label, path in (("src (архив)", p.src), ("trash (дубликаты)", p.trash)):
-            exists = Path(str(path)).exists()
-            st.markdown(f"**{label}:** `{path}`" + ("" if exists else " · ⚠️ не найден"))
-        st.caption("web читает src/trash **только для просмотра** (ro-маунты).")
+        # показываем HOST-пути (как в settings.toml/файловом менеджере хоста);
+        # ⚠️ существование проверяем по контейнерному пути — web видит именно его
+        for label, host, cont in (("src (архив)", p.src_host, p.src),
+                                  ("trash (дубликаты)", p.trash_host, p.trash)):
+            exists = Path(str(cont)).exists()
+            st.markdown(f"**{label}:** `{host}`" + ("" if exists else " · ⚠️ не найден"))
+        root_map, _ = path_map()
+        if root_map:
+            st.caption(f"Хост-корень маунта: `{root_map}` — задаётся один раз в .env "
+                       f"(PHOTOS_ROOT). Подпапки (src/trash) правятся в редакторе ниже.")
         if row and isinstance(row.get("params"), dict) and row["params"]:
             with st.expander("Параметры текущего/последнего запуска движка", expanded=False):
                 st.json(row["params"], expanded=1)
@@ -171,6 +293,17 @@ def _sidebar(settings: Settings, row: dict | None) -> None:
         )
 
 
+def _validate_paths_pair(src_h: str, trash_h: str) -> None:
+    """Валидация путей ДО записи в settings.toml — те же правила, что у движка:
+    непустые, внутри корня PATH_MAP_HOST (если задан), trash не внутри src."""
+    if not src_h.strip() or not trash_h.strip():
+        raise SettingsError("paths.src и paths.trash не могут быть пустыми")
+    probe = load_settings(None)
+    probe.paths.src_host, probe.paths.trash_host = src_h.strip(), trash_h.strip()
+    resolve_paths(probe.paths)
+    check_paths(probe)
+
+
 def _settings_editor(settings: Settings) -> None:
     with st.sidebar.expander("⚙️ Эффективные настройки + редактор", expanded=True):
         st.json(settings_to_dict(settings), expanded=1)
@@ -178,6 +311,16 @@ def _settings_editor(settings: Settings) -> None:
                    "вы правите settings.toml (те же значения увидит и CLI-движок).")
         with st.form("settings_form", border=True):
             scan, move, ui, analyze = settings.scan, settings.move, settings.ui, settings.analyze
+            src_h = st.text_input(
+                "paths.src — папка архива (путь на хосте)", value=settings.paths.src_host,
+                help="Путь КАК НА ХОСТЕ (редактируется отсюда). Должен лежать внутри корня "
+                     "PHOTOS_ROOT из .env — маунты docker на лету менять нельзя. "
+                     "Применится при следующем запуске движка/этапе.",
+            )
+            trash_h = st.text_input(
+                "paths.trash — папка дубликатов (путь на хосте)", value=settings.paths.trash_host,
+                help="Аналогично src: host-путь внутри PHOTOS_ROOT; не должен быть внутри src.",
+            )
             threads = st.number_input(
                 "scan.threads — потоки хэширования", 1, 64, value=scan.threads,
                 help="Применится: на этапе scan (старт движка или граница scan→analyze в `run`)",
@@ -196,9 +339,10 @@ def _settings_editor(settings: Settings) -> None:
                 help="Применится: на этапе move. Dry Run всегда главнее переноса",
             )
             keep_by = st.selectbox(
-                "move.keep_by — что считать оригиналом", ("size", "pixels"),
-                index=("size", "pixels").index(move.keep_by),
-                help="Применится: на этапе move (в т.ч. перевыбор оригинала в готовых группах)",
+                "move.keep_by — что считать оригиналом", ("capture", "size", "pixels"),
+                index=("capture", "size", "pixels").index(move.keep_by),
+                help="capture: время снимка (json-Takeout → файловая система → тай-брейк по имени). "
+                     "Применится: на этапе move (в т.ч. перевыбор оригинала в готовых группах)",
             )
             page = st.number_input(
                 "ui.page_size — групп на странице галереи", 5, 100, value=ui.page_size,
@@ -208,15 +352,36 @@ def _settings_editor(settings: Settings) -> None:
                 "ui.refresh_sec — интервал обновления монитора, с", 1, 60, value=ui.refresh_sec,
                 help="Применится: после перезапуска web (фрагменты создаются при старте процесса)",
             )
+            st.markdown("**Подтверждения опасных действий:**")
+            cdf = st.checkbox(
+                "Подтверждать удаление файлов (галерея, 🗑️)", value=ui.confirm_delete_files,
+                help="Диалог «удалить безвозвратно?» перед удалением файла из trash",
+            )
+            cca = st.checkbox(
+                "Подтверждать «Очистить все» (БД)", value=ui.confirm_clean_all,
+                help="Диалог перед очисткой результатов прогонов и журнала",
+            )
+            ccl = st.checkbox(
+                "Подтверждать очистку журнала", value=ui.confirm_clean_log,
+                help="Диалог перед очисткой журнала (events)",
+            )
             submitted = st.form_submit_button("💾 Сохранить в settings.toml")
         if submitted:
             updates: dict[str, dict[str, Any]] = {
+                "paths": {"src": src_h.strip(), "trash": trash_h.strip()},
                 "scan": {"threads": int(threads)},
                 "analyze": {"threshold": int(threshold)},
                 "move": {"mode": mode, "dry_run": bool(dry), "keep_by": keep_by},
-                "ui": {"page_size": int(page), "refresh_sec": int(refresh)},
+                "ui": {
+                    "page_size": int(page),
+                    "refresh_sec": int(refresh),
+                    "confirm_delete_files": bool(cdf),
+                    "confirm_clean_all": bool(cca),
+                    "confirm_clean_log": bool(ccl),
+                },
             }
             try:
+                _validate_paths_pair(src_h, trash_h)
                 update_settings_file(SETTINGS_PATH, updates)
                 st.toast("Настройки сохранены в settings.toml", icon="💾")
                 st.rerun()
@@ -242,7 +407,8 @@ def monitor_fragment() -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Этап", str(row["stage"]))
     c2.metric("Обработано", f"{processed} из {total}", f"{pct * 100:.1f}%")
-    c3.metric("Скорость", f"{speed:.1f} файлов/с")
+    speed_unit = "бакетов/с" if row["stage"] == "analyze" else "файлов/с"
+    c3.metric("Скорость", f"{speed:.1f} {speed_unit}")
     eta = fmt_eta((total - processed) / speed) if (working and speed > 0 and total) else None
     c4.metric("ETA", eta)
 
@@ -296,12 +462,47 @@ def monitor_fragment() -> None:
     if working and row["stop_requested"]:
         cb.caption("Ожидание остановки движка…")
 
+    # --- запуск движка из UI (1.4.0) ---
     settings_now = _load_settings_quiet()
+    spawned = _spawned_alive()
+    st.caption("**Запуск движка** (subprocess внутри web-контейнера — эквивалент "
+               "`docker compose run --rm engine …`):")
+    b1, b2, b3, _ = st.columns([1.1, 1.1, 1.2, 3.5])
+    busy = working or bool(spawned)
+    if b1.button("▶️ Запустить run", disabled=busy,
+                 help="Полный цикл scan → analyze → move (как `docker compose run --rm engine run`):"):
+        _spawn_engine("run", working=working)
+    if b2.button("🔍 Запустить scan", disabled=busy,
+                 help="Только индексация и хэширование (как `docker compose run --rm engine scan`):"):
+        _spawn_engine("scan", working=working)
+    if b3.button("💥 Очистить все", type="primary", disabled=busy,
+                 help="Очистить БД: результаты прогонов и журнал. ФАЙЛЫ НА ДИСКЕ НЕ ЗАТРАГИВАЮТСЯ"):
+        _confirm_or("confirm_wipe", settings_now is None or settings_now.ui.confirm_clean_all,
+                    _wipe_results)
+    if st.session_state.get("confirm_wipe"):
+        st.warning(
+            "⚠️ Будут очищены **результаты прежних прогонов и журнал**: "
+            "индекс файлов и хэши, все runs/группы, события (events). "
+            "Сами файлы на диске (src и trash) не затрагиваются."
+        )
+        wy, wn, _ = st.columns([1, 1, 5])
+        if wy.button("✅ Да, очистить", type="primary", key="wipe_yes"):
+            st.session_state["confirm_wipe"] = False
+            _wipe_results()
+        if wn.button("Отмена", key="wipe_no"):
+            st.session_state["confirm_wipe"] = False
+            st.rerun(scope="fragment")
+    if spawned:
+        st.caption("🟢 Запущено из UI: " + ", ".join(
+            f"`engine {c}` (pid {p.pid})" for c, p in spawned))
+        with st.expander("stdout/stderr запуска из UI"):
+            st.code(_engine_log_tail() or "(пока пусто)", language=None)
+
     if settings_now is not None and settings_now.move.mode == "manual":
         with st.expander("⚠️ Опасная зона (manual-режим): подтверждение переноса"):
             st.caption(
                 "Подтверждённые группы будут физически перенесены в trash командой "
-                "`docker compose run --rm engine move`."
+                "`docker compose run --rm engine move` (или кнопками запуска выше)."
             )
             _confirm_all_block(lr)
 
@@ -333,6 +534,20 @@ def _confirm_all_block(lr: dict | None) -> None:
 def journal_fragment() -> None:
     tf = time.perf_counter()
     rows = q("SELECT id, ts, level, message FROM events ORDER BY id DESC LIMIT 200")
+    jc1, jc2 = st.columns([1, 5])
+    if jc1.button("🧹 Очистить", disabled=not rows,
+                  help="Удалить все записи журнала (events)"):
+        s_now = _load_settings_quiet()
+        _confirm_or("confirm_log", s_now is None or s_now.ui.confirm_clean_log, _clear_events)
+    if st.session_state.get("confirm_log"):
+        st.warning("⚠️ Очистить журнал — будут удалены все записи (events)?")
+        ly, ln, _ = st.columns([1, 1, 5])
+        if ly.button("✅ Да, очистить", type="primary", key="log_yes"):
+            st.session_state["confirm_log"] = False
+            _clear_events()
+        if ln.button("Отмена", key="log_no"):
+            st.session_state["confirm_log"] = False
+            st.rerun(scope="fragment")
     st.caption(f"последние {len(rows)} записей · автообновление {MONITOR_REFRESH_SEC} с · "
                f"фрагмент: {(time.perf_counter() - tf) * 1000:.0f} мс")
     if not rows:
@@ -352,7 +567,7 @@ def gallery_tab(settings: Settings) -> None:
     lr = last_run()
     if lr is None:
         st.info("Анализ ещё не выполнялся. Запустите `docker compose run --rm engine run` "
-                "(или отдельно `scan` + `analyze`).")
+                "или кнопкой «▶️ Запустить run» на вкладке «🖥 Монитор».")
         return
     st.caption(
         f"Run **#{lr['id']}** от {lr['created_at']:%Y-%m-%d %H:%M} · threshold {lr['threshold']} · "
@@ -391,33 +606,51 @@ def gallery_tab(settings: Settings) -> None:
         """,
         (lr["id"], page_size, st.session_state.gallery_page * page_size),
     )
-    for g in page_rows:
-        _render_group(g, settings)
-
-
-def _render_group(g: dict, settings: Settings) -> None:
-    members = q(
+    # Члены ВСЕХ групп страницы одним батч-запросом (ANY по ids страницы) —
+    # вместо N+1 запроса на каждую группу. Объём ограничен page_size группами.
+    ids = [g["id"] for g in page_rows]
+    member_rows = q(
         """
-        SELECT gm.file_id, gm.role, gm.moved_to, f.path, f.size, f.width, f.height
+        SELECT gm.group_id, gm.file_id, gm.role, gm.moved_to,
+               f.path, f.size, f.width, f.height
         FROM group_members gm JOIN files f ON f.id = gm.file_id
-        WHERE gm.group_id = %s
+        WHERE gm.group_id = ANY(%s)
         ORDER BY (gm.role = 'kept') DESC, f.size DESC, f.path
         """,
-        (g["id"],),
-    )
+        (ids,),
+    ) if ids else []
+    by_group: dict[int, list[dict]] = {}
+    for r in member_rows:
+        by_group.setdefault(r["group_id"], []).append(r)
+    for g in page_rows:
+        _render_group(g, by_group.get(g["id"], []), settings)
+
+
+def _render_group(g: dict, members: list[dict], settings: Settings) -> None:
     if not members:
         return
     info = g.get("info") if isinstance(g.get("info"), dict) else {}
-    title = (f"Группа #{g['id']} · {g['member_count']} файлов · {human_size(g['total_size'])}"
-             + (f" · мин. дистанция {info.get('min_distance')}" if info.get("min_distance") is not None else "")
-             + (" · ✅ подтверждена" if g["confirmed"] else ""))
+    orig_name = Path(g["kept_path"]).name if g.get("kept_path") else None
+    title = (
+        f"Группа #{g['id']}"
+        + (f" · {orig_name}" if orig_name else "")
+        + f" · {g['member_count']} файлов · {human_size(g['total_size'])}"
+        + (f" · мин. дистанция {info.get('min_distance')}" if info.get("min_distance") is not None else "")
+        + (" · ✅ подтверждена" if g["confirmed"] else "")
+    )
     with st.expander(title):
-        lines = []
+        lines, moved = [], []
         for m in members:
-            icon = "⭐" if m["role"] == "kept" else "🗑"
+            icon = "⭐" if m["role"] == "kept" else "📋"
             dims = f"{m['width']}×{m['height']}" if m["width"] and m["height"] else "?"
-            note = f" → перенесён: `{m['moved_to']}`" if m["moved_to"] else ""
-            lines.append(f"{icon} `{m['path']}` — {human_size(m['size'])}, {dims}{note}")
+            base = f"{icon} `{container_to_host(m['path'])}` — {human_size(m['size'])}, {dims}"
+            if m["moved_to"]:
+                moved.append(m)
+                lines.append(base + f" → в trash: `{container_to_host(m['moved_to'])}`")
+            elif m["role"] == "kept":
+                lines.append(base)
+            else:
+                lines.append(base + " · ещё в архиве (не перенесён)")
         st.markdown("\n\n".join(lines))
 
         c1, c2, _ = st.columns([1, 1, 4])
@@ -433,8 +666,66 @@ def _render_group(g: dict, settings: Settings) -> None:
                     q("UPDATE groups SET confirmed = true WHERE id=%s", (g["id"],), fetch=False)
                     st.toast(f"Группа #{g['id']} подтверждена", icon="✅")
                     st.rerun()
+
+        # Кнопки над ПЕРЕНЕСЁННЫМИ дубликатами (файл физически лежит в trash):
+        # «↩️ Вернуть» — на прежнее место (files.path), «🗑️ Удалить» — с диска.
+        if moved:
+            st.markdown("**Действия с перенесёнными дубликатами:**")
+            for m in moved:
+                r1, r2, r3, _ = st.columns([6, 1, 1, 2])
+                r1.markdown(
+                    f"📋 `{container_to_host(m['moved_to'])}` — {human_size(m['size'])}")
+                if r2.button("↩️ Вернуть", key=f"ret_{m['file_id']}",
+                             help="Вернуть файл из trash на прежнее место в архиве"):
+                    _restore_member(m)
+                if r3.button("🗑️ Удалить", key=f"del_{m['file_id']}",
+                             help="Удалить файл с диска (безвозвратно)"):
+                    _delete_member(m, settings)
+
         if show:
             _render_thumbs(members)
+
+
+def _restore_member(m: dict) -> None:
+    """Кнопка «↩️ Вернуть»: файл из trash — на прежнее место (web/actions.py)."""
+    from web import actions  # лениво: PIL/numpy/imagehash не нужны при старте UI
+    try:
+        msg = actions.restore_file(SETTINGS_PATH, m["file_id"])
+        st.toast(msg, icon="↩️")
+    except Exception as e:
+        st.error(f"Не удалось вернуть файл: {e}")
+    st.rerun()
+
+
+@st.dialog("🗑️ Удалить дубликат?", width="small")
+def _delete_dialog(m: dict) -> None:
+    st.markdown(f"Удалить файл **с диска безвозвратно**?\n\n`{container_to_host(m['moved_to'])}`")
+    st.caption("Файл сейчас лежит в trash. После удаления восстановить его будет невозможно.")
+    c1, c2, _ = st.columns([1, 1, 3])
+    if c1.button("🗑️ Да, удалить", type="primary"):
+        from web import actions
+        try:
+            actions.delete_file(SETTINGS_PATH, m["file_id"])
+            st.toast("Файл удалён", icon="🗑️")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Не удалось удалить: {e}")  # диалог остаётся открытым
+    if c2.button("Отмена"):
+        st.rerun()
+
+
+def _delete_member(m: dict, settings: Settings) -> None:
+    """Кнопка «🗑️ Удалить»: диалог подтверждения (или сразу — если отключён в настройках)."""
+    if settings.ui.confirm_delete_files:
+        _delete_dialog(m)
+        return
+    from web import actions
+    try:
+        actions.delete_file(SETTINGS_PATH, m["file_id"])
+        st.toast("Файл удалён", icon="🗑️")
+    except Exception as e:
+        st.error(f"Не удалось удалить: {e}")
+    st.rerun()
 
 
 def _render_thumbs(members: list[dict]) -> None:

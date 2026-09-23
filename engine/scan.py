@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -191,11 +192,31 @@ def run_scan(ctx: "EngineContext", *, force: bool = False) -> ScanStats:
                  params=ctx.params_payload({"force": force}), pid=os.getpid())
 
     stats = ScanStats()
-    stats.total = count_files(src, trash, exts, s.scan.recursive)
     ctx.log.info(
-        f"scan: старт; найдено {stats.total} файлов-кандидатов "
+        f"scan: старт; подсчёт файлов-кандидатов идёт в фоне "
         f"(threads={s.scan.threads}, batch={s.scan.batch_size}, force={force})"
     )
+
+    # Подсчёт кандидатов — в фоновом потоке: раньше это был ОТДЕЛЬНЫЙ блокирующий
+    # обход дерева до начала хэширования (двойной обход на холодном кэше стоил
+    # минут на больших архивах). Поток не трогает БД (psycopg-соединения не
+    # потокобезопасны) и не проверяет stop-флаг — он демон, максимум что
+    # случится — дор walkает дерево в фоне и запишет число в dict.
+    total_holder: dict[str, int] = {}
+
+    def _count_candidates() -> None:
+        try:
+            total_holder["n"] = sum(1 for _ in iter_files(src, trash, exts, s.scan.recursive))
+        except OSError:
+            pass  # частичный/нулевой знаменатель лучше падения счётчика
+
+    counter = threading.Thread(target=_count_candidates, name="scan-count", daemon=True)
+    counter.start()
+
+    def adopt_total() -> None:
+        """Забрать готовый знаменатель прогресс-бара из фонового счётчика."""
+        if stats.total == 0 and "n" in total_holder:
+            stats.total = total_holder["n"]
 
     existing = _load_existing(conn)
     with_hashes = _load_ids_with_hashes(conn)
@@ -288,6 +309,7 @@ def run_scan(ctx: "EngineContext", *, force: bool = False) -> ScanStats:
             now = time.monotonic()
             if now - last_status_t >= 0.5:
                 last_status_t = now
+                adopt_total()
                 _report(conn_ctl, stats, ema_speed, last_path)
 
         # --- мягкая остановка: отменяем не начатые, доделываем in-flight ---
@@ -310,6 +332,9 @@ def run_scan(ctx: "EngineContext", *, force: bool = False) -> ScanStats:
                 f"scan: остановка по флагу; обработано {stats.found}, закоммичено {stats.hashed}"
             )
 
+    if not stats.stopped:
+        counter.join(timeout=10.0)  # досчитать знаменатель для финального отчёта
+    adopt_total()
     flush()
     _report(conn_ctl, stats, ema_speed, last_path)
     set_stage(conn_ctl, "stopped" if stats.stopped else "done")

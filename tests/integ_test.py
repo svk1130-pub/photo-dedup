@@ -93,27 +93,29 @@ assert n_moved == n_members - n_groups, "все дубли перенесены"
 assert n_hashes_after == 8 * n_groups, "хэши перенесённых удалены, оригиналы остались"
 print("1c. move OK (auto, хэши дубликатов очищены)")
 
-# галерея: moved_to указывает в trash/group_*, файл существует
+# галерея: moved_to указывает в папку группы в trash, файл существует
 rows = conn.execute(
     "SELECT gm.moved_to FROM group_members gm WHERE gm.moved_to IS NOT NULL LIMIT 50"
 ).fetchall()
 for (mv,) in rows:
-    assert mv.startswith(str(trash / "group_")) and Path(mv).exists(), mv
+    assert mv.startswith(str(trash)) and Path(mv).exists(), mv
 kept_rows = conn.execute(
     "SELECT kept_path FROM groups WHERE kept_path IS NOT NULL"
 ).fetchall()
 for (kp,) in kept_rows:
     assert Path(kp).exists() and str(kp).startswith(str(src)), kp
-print("2. DB state consistent; moved_to -> trash/group_N exists on disk OK")
+print("2. DB state consistent; moved_to -> именованная папка группы в trash exists on disk OK")
 
 n_events = conn.execute("SELECT count(*) FROM events").fetchone()[0]
 assert n_events > 0
 
-gdirs = list(trash.glob("group_*"))
-assert len(gdirs) == n_groups
+# папки групп названы по оригиналу (префикс «_»), у каждой — info.txt
+gdirs = sorted(p for p in trash.iterdir() if p.is_dir())
+assert len(gdirs) == n_groups, f"{len(gdirs)} папок != {n_groups} групп"
 for gd in gdirs:
-    assert (gd / "info.txt").exists(), gd
-print("3. trash/group_N с info.txt OK:", len(gdirs), "dirs")
+    assert gd.name.startswith("_") and (gd / "info.txt").exists(), gd
+print("3. именованные папки групп с info.txt OK:", len(gdirs), "dirs:",
+      ", ".join(gd.name for gd in gdirs[:4]), "…")
 
 # --- 4) resume: повторный scan пропускает всё ---
 from engine.cli import main  # noqa: E402  (уже импортирован)
@@ -212,9 +214,12 @@ assert rc == 0
 moved_confirmed = conn.execute("SELECT count(*) FROM group_members WHERE moved_to IS NOT NULL").fetchone()[0]
 members_of_first = conn.execute("SELECT member_count FROM groups WHERE id=%s", (first_group,)).fetchone()[0]
 assert moved_confirmed == moved_before + (members_of_first - 1), "перенесена ровно подтверждённая группа"
-gd = trash / f"group_{first_group}"
+gdir1 = conn.execute(
+    "SELECT info->>'group_dir' FROM groups WHERE id=%s", (first_group,)
+).fetchone()[0]
+gd = trash / gdir1
 assert gd.exists() and (gd / "info.txt").exists()
-print(f"9b. manual: подтверждённая группа #{first_group} перенесена ({members_of_first - 1} файлов) OK")
+print(f"9b. manual: подтверждённая группа #{first_group} перенесена в «{gdir1}» ({members_of_first - 1} файлов) OK")
 
 # ещё одна группа — через --group-id без подтверждения
 second_group = conn.execute(
@@ -222,27 +227,351 @@ second_group = conn.execute(
 ).fetchone()[0]
 rc = cli_main(["--settings", str(settings_path), "move", "--group-id", str(second_group)])
 assert rc == 0
-assert (trash / f"group_{second_group}").exists()
-print(f"9c. move --group-id #{second_group}: принудительный перенос OK")
+gdir2 = conn.execute(
+    "SELECT info->>'group_dir' FROM groups WHERE id=%s", (second_group,)
+).fetchone()[0]
+assert (trash / gdir2).exists()
+print(f"9c. move --group-id #{second_group}: принудительный перенос в «{gdir2}» OK")
 
-# --- 10) галерейные запросы UI (лимитированные) ---
+# --- 10) галерейные запросы UI (лимитированные; члены страницы ОДНИМ батч-запросом) ---
 page = conn.execute(
     "SELECT id, member_count, total_size, kept_path, confirmed, info FROM groups "
     "WHERE run_id=%s ORDER BY total_size DESC, id LIMIT %s OFFSET %s",
     (run_dry, 15, 0),
 ).fetchall()
 assert len(page) >= 2
-members = conn.execute(
-    "SELECT gm.file_id, gm.role, gm.moved_to, f.path, f.size, f.width, f.height "
-    "FROM group_members gm JOIN files f ON f.id=gm.file_id WHERE gm.group_id=%s "
+ids10 = [r[0] for r in page]
+members_all = conn.execute(
+    "SELECT gm.group_id, gm.file_id, gm.role, gm.moved_to, f.path, f.size, f.width, f.height "
+    "FROM group_members gm JOIN files f ON f.id=gm.file_id WHERE gm.group_id = ANY(%s) "
     "ORDER BY (gm.role='kept') DESC, f.size DESC, f.path",
-    (page[0][0],),
+    (ids10,),
 ).fetchall()
-assert len(members) == page[0][1]
+assert len(members_all) == sum(r[1] for r in page), "батч-запрос покрывает все группы страницы"
+first_members = [m for m in members_all if m[0] == page[0][0]]
+assert len(first_members) == page[0][1]
 # перенесённые показывают moved_to (актуальный путь), оригинал — путь в src
-moved_rows = [m for m in members if m[2] is not None]
-assert all(str(m[2]).startswith(str(trash)) for m in moved_rows)
-print("10. gallery queries OK (page LIMIT/OFFSET, members, актуальные moved_to)")
+moved_rows = [m for m in first_members if m[3] is not None]
+assert all(str(m[3]).startswith(str(trash)) for m in moved_rows)
+print("10. gallery queries OK (page LIMIT/OFFSET, батч-запрос членов ANY(), актуальные moved_to)")
+
+# --- 11) точные (байт-в-байт) копии: sha256-верификация на этапе move + dry-run read-only ---
+import random as _random
+sys.path.insert(0, str(PROJ / "scripts"))
+import make_testset as _mts
+from PIL import Image as PILImage
+
+exact_dir = src / "exact"
+exact_dir.mkdir()
+# имена подобраны так, чтобы оригинал детерминированно выигрывал tie-break по пути;
+# текстурированное изображение — чтобы повёрнутая копия гарантированно сгруппировалась;
+# паддинг после EOI (безвреден для JPEG-декодера) делает оригинал строго крупнейшим,
+# чтобы keep_by=size детерминированно оставлял именно его
+img_x = _mts.make_base(99, _random.Random(7))
+orig_f = exact_dir / "a_original.jpg"
+img_x.save(orig_f, "JPEG", quality=92)
+with open(orig_f, "ab") as f:
+    f.write(b"\x00" * 65536)
+shutil.copyfile(orig_f, exact_dir / "z_exact_copy.jpg")  # байт-в-байт (с паддингом)
+img_x.transpose(PILImage.Transpose.ROTATE_90).save(exact_dir / "z_rot90.jpg", "JPEG", quality=95)
+
+assert cli_main(["--settings", str(settings_path), "scan"]) == 0
+assert cli_main(["--settings", str(settings_path), "analyze"]) == 0
+run_x = conn.execute("SELECT max(id) FROM analysis_runs").fetchone()[0]
+g_exact = conn.execute(
+    "SELECT gm.group_id FROM group_members gm JOIN files f ON f.id=gm.file_id WHERE f.path=%s",
+    (str(exact_dir / "a_original.jpg"),),
+).fetchone()[0]
+member_count_exact = conn.execute(
+    "SELECT member_count FROM groups WHERE id=%s", (g_exact,)
+).fetchone()[0]
+assert member_count_exact == 3, member_count_exact
+
+hashes_before_dry = conn.execute("SELECT count(*) FROM hashes").fetchone()[0]
+info_before_dry = conn.execute("SELECT info FROM groups WHERE id=%s", (g_exact,)).fetchone()[0]
+
+rc = cli_main(["--settings", str(settings_path), "move", "--dry-run"])
+assert rc == 0
+msg = conn.execute(
+    "SELECT message FROM events WHERE message LIKE %s ORDER BY id DESC LIMIT 1",
+    (f"DRY RUN группа #{g_exact}:%",),
+).fetchone()[0]
+assert msg.count("точная копия оригинала (sha256)") == 1, msg
+assert "точных копий оригинала: 1 из 2" in msg, msg
+assert conn.execute("SELECT count(*) FROM hashes").fetchone()[0] == hashes_before_dry, \
+    "dry-run не должен менять hashes"
+assert conn.execute("SELECT info FROM groups WHERE id=%s", (g_exact,)).fetchone()[0] == info_before_dry, \
+    "dry-run не должен менять groups.info"
+assert (exact_dir / "z_exact_copy.jpg").exists(), "dry-run: файл не должен покидать src"
+print("11a. sha256-верификация в dry-run (маркеры точных копий) + БД не тронута OK")
+
+rc = cli_main(["--settings", str(settings_path), "move"])
+assert rc == 0
+gdir_exact = conn.execute(
+    "SELECT info->>'group_dir' FROM groups WHERE id=%s", (g_exact,)
+).fetchone()[0]
+info_txt = (trash / gdir_exact / "info.txt").read_text(encoding="utf-8")
+assert "Точных копий оригинала среди перемещённых (sha256): 1 из 2" in info_txt, info_txt
+info_after = dict(conn.execute("SELECT info FROM groups WHERE id=%s", (g_exact,)).fetchone()[0])
+assert info_after.get("exact_kept_copies") == 1, info_after
+assert info_after.get("dups_sha_checked") == 2, info_after
+assert (exact_dir / "a_original.jpg").exists(), "оригинал должен остаться в src"
+assert not (exact_dir / "z_exact_copy.jpg").exists(), "точная копия должна быть перенесена"
+assert (trash / gdir_exact / "z_exact_copy.jpg").exists()
+print("11b. точная копия перенесена, info.txt и groups.info отмечают sha256 OK")
+
+# --- 12) keep_by=capture: оригинал по json-Takeout/ФС + папки групп по имени оригинала ---
+import io as _io
+import json as _json12
+
+tk = src / "takeout"
+tk.mkdir()
+# Группа A: байт-в-байт копии «IMG_20260912_163920.jpg»; у оригинала — Takeout-sidecar,
+# время снимка (2020) заведомо раньше любых файловых времён — json обязан выиграть.
+img12 = _mts.make_base(555, _random.Random(99))
+buf12 = _io.BytesIO()
+img12.save(buf12, "JPEG", quality=92)
+blob12 = buf12.getvalue()
+orig12 = tk / "IMG_20260912_163920.jpg"
+orig12.write_bytes(blob12)
+(tk / "IMG_20260912_163920.jpg.json").write_text(_json12.dumps({
+    "title": "IMG_20260912_163920.jpg",
+    "photoTakenTime": {"timestamp": "1590000000", "formatted": "20 мая 2020 г., 18:40:00 UTC"},
+    "creationTime": {"timestamp": "1590100000", "formatted": "…"},
+}), encoding="utf-8")
+for i in (2, 3):
+    (tk / f"IMG_20260912_163920 (Copy {i}).jpg").write_bytes(blob12)
+# Группа B: без json — при равных файловых временах чистое имя бьёт «(Copy N)».
+dsc12 = tk / "dsc"
+dsc12.mkdir()
+img12b = _mts.make_base(556, _random.Random(100))
+buf12b = _io.BytesIO()
+img12b.save(buf12b, "JPEG", quality=92)
+blob12b = buf12b.getvalue()
+(dsc12 / "DSC_0001.jpg").write_bytes(blob12b)
+for i in (2, 3):
+    (dsc12 / f"DSC_0001 (Copy {i}).jpg").write_bytes(blob12b)
+# одинаковые (прошлые) файловые времена у всех: ФС не должна решать спор
+t12 = 1700000000
+for p in list(tk.glob("*.jpg")) + list(dsc12.glob("*.jpg")):
+    os.utime(p, (t12, t12))
+
+assert cli_main(["--settings", str(settings_path), "scan"]) == 0
+assert cli_main(["--settings", str(settings_path), "analyze"]) == 0
+g_tk = conn.execute(
+    "SELECT gm.group_id FROM group_members gm JOIN files f ON f.id=gm.file_id WHERE f.path=%s",
+    (str(orig12),),
+).fetchone()[0]
+g_dsc = conn.execute(
+    "SELECT gm.group_id FROM group_members gm JOIN files f ON f.id=gm.file_id WHERE f.path=%s",
+    (str(dsc12 / "DSC_0001.jpg"),),
+).fetchone()[0]
+assert g_tk != g_dsc, "разные текстуры не должны сгруппироваться вместе"
+
+rc = cli_main(["--settings", str(settings_path), "move", "--dry-run", "--keep-by", "capture"])
+assert rc == 0
+msg_tk = conn.execute(
+    "SELECT message FROM events WHERE message LIKE %s ORDER BY id DESC LIMIT 1",
+    (f"DRY RUN группа #{g_tk}:%",),
+).fetchone()[0]
+assert f"оставить {orig12}" in msg_tk, msg_tk
+assert "(Copy" not in msg_tk.split("перенести")[0], "json-файл должен быть оригиналом"
+assert "источник: json photoTakenTime" in msg_tk, msg_tk
+assert "_IMG_20260912_163920.jpg" in msg_tk, "в плане фигурирует именованная папка"
+msg_dsc = conn.execute(
+    "SELECT message FROM events WHERE message LIKE %s ORDER BY id DESC LIMIT 1",
+    (f"DRY RUN группа #{g_dsc}:%",),
+).fetchone()[0]
+assert f"оставить {dsc12 / 'DSC_0001.jpg'}" in msg_dsc, msg_dsc
+print("12a. dry-run capture: json-файл и чистое имя выбраны оригиналами OK")
+
+rc = cli_main(["--settings", str(settings_path), "move", "--keep-by", "capture"])
+assert rc == 0
+dir12 = trash / "_IMG_20260912_163920.jpg"
+assert dir12.is_dir(), sorted(p.name for p in trash.iterdir())
+assert (dir12 / "IMG_20260912_163920 (Copy 2).jpg").exists()
+assert (dir12 / "IMG_20260912_163920 (Copy 3).jpg").exists()
+assert orig12.exists(), "оригинал (по json) остаётся в src"
+assert not (tk / "IMG_20260912_163920 (Copy 2).jpg").exists()
+info12 = dict(conn.execute("SELECT info FROM groups WHERE id=%s", (g_tk,)).fetchone()[0])
+assert info12.get("group_dir") == "_IMG_20260912_163920.jpg", info12
+assert info12.get("kept_capture_source") == "json photoTakenTime", info12
+assert abs(info12.get("kept_capture_time", 0) - 1590000000.0) < 1e-6
+info12txt = (dir12 / "info.txt").read_text(encoding="utf-8")
+assert "keep_by): capture" in info12txt and "источник: json photoTakenTime" in info12txt
+# группа B: папка по чистому имени, оригинал остался
+dir12b = trash / "_DSC_0001.jpg"
+assert dir12b.is_dir() and (dir12b / "DSC_0001 (Copy 2).jpg").exists()
+assert (dsc12 / "DSC_0001.jpg").exists(), "оригинал DSC (чистое имя) остаётся в src"
+print("12b. move capture: папки _IMG_20260912_163920.jpg / _DSC_0001.jpg, json в info.txt OK")
+
+# 12c) коллизии: два оригинала с одинаковым basename в разных папках → __2
+coll = src / "coll"
+for sub, seed in (("a", 601), ("b", 602)):
+    d = coll / sub
+    d.mkdir(parents=True)
+    imc = _mts.make_base(seed, _random.Random(seed))
+    imc.save(d / "IMG_X.jpg", "JPEG", quality=92)
+    imc.transpose(PILImage.Transpose.ROTATE_90).save(d / "IMG_X_rot90.jpg", "JPEG", quality=95)
+    os.utime(d / "IMG_X.jpg", (t12, t12))
+    os.utime(d / "IMG_X_rot90.jpg", (t12, t12))
+assert cli_main(["--settings", str(settings_path), "scan"]) == 0
+assert cli_main(["--settings", str(settings_path), "analyze"]) == 0
+rc = cli_main(["--settings", str(settings_path), "move", "--keep-by", "capture"])
+assert rc == 0
+assert (trash / "_IMG_X.jpg").is_dir() and (trash / "_IMG_X__2.jpg").is_dir(), \
+    sorted(p.name for p in trash.iterdir())
+kept_coll = conn.execute(
+    "SELECT kept_path, info->>'group_dir' FROM groups "
+    "WHERE info->>'group_dir' IN ('_IMG_X.jpg', '_IMG_X__2.jpg') ORDER BY id"
+).fetchall()
+assert len(kept_coll) == 2, kept_coll
+assert (coll / "a" / "IMG_X.jpg").exists() and (coll / "b" / "IMG_X.jpg").exists(), \
+    "оба оригинала IMG_X.jpg остались в src"
+print("12c. коллизия имён папок групп разрешена суффиксом __2 OK")
+
+# --- 13) crash-recovery одноимённых дубликатов + files.status='moved' ---
+import shutil  # noqa: E402
+
+recdir = src / "rec"
+(recdir / "base").mkdir(parents=True)
+(recdir / "d1").mkdir()
+(recdir / "d2").mkdir()
+# seed/idx подобраны вне последовательности make_testset (shared rng(42)):
+# иначе «случайное» изображение совпадёт с bulk/original_000.jpg и прильнёт к группе
+img13 = _mts.make_base(703, _random.Random(999))
+buf13 = _io.BytesIO()
+img13.save(buf13, "JPEG", quality=92)
+blob13 = buf13.getvalue()
+# три байт-в-байт копии с ОДИНАКОВЫМ basename в разных папках:
+# при переносе дубликаты получают имена IMG.jpg и IMG_1.jpg (_unique_target)
+(recdir / "base" / "IMG.jpg").write_bytes(blob13)
+(recdir / "d1" / "IMG.jpg").write_bytes(blob13)
+(recdir / "d2" / "IMG.jpg").write_bytes(blob13)
+for p in recdir.rglob("*.jpg"):
+    os.utime(p, (t12, t12))
+assert cli_main(["--settings", str(settings_path), "scan"]) == 0
+assert cli_main(["--settings", str(settings_path), "analyze"]) == 0
+g_rec = conn.execute(
+    "SELECT gm.group_id FROM group_members gm JOIN files f ON f.id=gm.file_id WHERE f.path=%s",
+    (str(recdir / "base" / "IMG.jpg"),),
+).fetchone()[0]
+assert conn.execute("SELECT member_count FROM groups WHERE id=%s", (g_rec,)).fetchone()[0] == 3
+
+# Эмулируем падение move между файловыми операциями и коммитом БД:
+# оба дубликата уже лежат в папке группы (IMG.jpg и IMG_1.jpg), БД не знает об этом
+dest13 = trash / "_IMG.jpg"
+dest13.mkdir()
+shutil.move(str(recdir / "d1" / "IMG.jpg"), str(dest13 / "IMG.jpg"))
+shutil.move(str(recdir / "d2" / "IMG.jpg"), str(dest13 / "IMG_1.jpg"))
+rc = cli_main(["--settings", str(settings_path), "move"])
+assert rc == 0
+rec_moved = conn.execute(
+    "SELECT f.path, gm.moved_to FROM group_members gm JOIN files f ON f.id=gm.file_id "
+    "WHERE gm.group_id=%s AND gm.moved_to IS NOT NULL ORDER BY f.path",
+    (g_rec,),
+).fetchall()
+assert len(rec_moved) == 2, rec_moved
+assert rec_moved[0][1] == str(dest13 / "IMG.jpg"), rec_moved
+assert rec_moved[1][1] == str(dest13 / "IMG_1.jpg"), \
+    f"второй одноимённый дубликат не должен «приклеиться» к первому файлу: {rec_moved}"
+assert (recdir / "base" / "IMG.jpg").exists(), "оригинал остаётся в src"
+assert conn.execute(
+    "SELECT count(*) FROM group_members WHERE group_id=%s AND moved_to IS NOT NULL AND moved_at IS NULL",
+    (g_rec,),
+).fetchone()[0] == 0, "moved_at доносится recovery-строкам"
+# хэши восстановленных дубликатов тоже удалены (остались только у kept)
+n_hash_rec = conn.execute(
+    "SELECT count(*) FROM hashes h JOIN files f ON f.id=h.file_id WHERE f.path LIKE %s",
+    (str(recdir) + "%",),
+).fetchone()[0]
+assert n_hash_rec == 8, n_hash_rec
+# строки files помечены status='moved'
+assert conn.execute(
+    "SELECT status FROM files WHERE path=%s", (str(recdir / "d1" / "IMG.jpg"),)
+).fetchone()[0] == "moved"
+moved_files_n = conn.execute("SELECT count(*) FROM files WHERE status='moved'").fetchone()[0]
+assert moved_files_n >= 2
+print(f"13. recovery одноимённых дубликатов (IMG.jpg × 2 → IMG.jpg/IMG_1.jpg) "
+      f"+ files.status='moved' OK ({moved_files_n} строк помечено)")
+
+# --- 14) web/actions: «↩️ Вернуть» — дубликат возвращается из trash на прежнее место ---
+from web import actions
+
+mv14 = conn.execute(
+    "SELECT gm.file_id, gm.moved_to, f.path FROM group_members gm "
+    "JOIN files f ON f.id = gm.file_id WHERE gm.moved_to IS NOT NULL LIMIT 1"
+).fetchone()
+fid14, moved14, orig14 = mv14
+assert Path(moved14).exists() and not Path(orig14).exists()
+assert conn.execute("SELECT status FROM files WHERE id=%s", (fid14,)).fetchone()[0] == "moved"
+actions.restore_file(str(settings_path), fid14)
+assert Path(orig14).exists(), "файл вернулся на прежнее место"
+assert not Path(moved14).exists(), "из trash файл исчез"
+assert conn.execute("SELECT status FROM files WHERE id=%s", (fid14,)).fetchone()[0] == "ok"
+n_h14 = conn.execute("SELECT count(*) FROM hashes WHERE file_id=%s", (fid14,)).fetchone()[0]
+assert n_h14 == 8, f"хэши пересчитаны (8 вариантов), а не {n_h14}"
+assert conn.execute(
+    "SELECT count(*) FROM group_members WHERE file_id=%s AND moved_to IS NOT NULL", (fid14,)
+).fetchone()[0] == 0, "moved_to сброшен"
+assert conn.execute(
+    "SELECT count(*) FROM events WHERE message LIKE 'web:%'"
+).fetchone()[0] >= 1, "событие операции попало в журнал"
+try:  # повторный возврат невозможен: файл больше не в trash
+    actions.restore_file(str(settings_path), fid14)
+    raise AssertionError("expected FileOpError")
+except actions.FileOpError:
+    pass
+print("14. web-actions restore: возврат из trash, хэши пересчитаны, status='ok' OK")
+
+# --- 15) web/actions: «🗑️ Удалить» — дубликат удаляется с диска и из БД ---
+mv15 = conn.execute(
+    "SELECT gm.file_id, f.size, f.path, gm.moved_to FROM group_members gm "
+    "JOIN files f ON f.id = gm.file_id WHERE gm.moved_to IS NOT NULL LIMIT 1"
+).fetchone()
+fid15, size15, orig15, moved15 = mv15
+g15 = conn.execute("SELECT group_id FROM group_members WHERE file_id=%s", (fid15,)).fetchone()[0]
+cnt15 = conn.execute("SELECT member_count FROM groups WHERE id=%s", (g15,)).fetchone()[0]
+tot15 = conn.execute("SELECT total_size FROM groups WHERE id=%s", (g15,)).fetchone()[0]
+assert Path(moved15).exists()
+actions.delete_file(str(settings_path), fid15)
+assert not Path(moved15).exists(), "файл удалён с диска"
+assert conn.execute("SELECT count(*) FROM files WHERE id=%s", (fid15,)).fetchone()[0] == 0
+assert conn.execute("SELECT count(*) FROM hashes WHERE file_id=%s", (fid15,)).fetchone()[0] == 0
+cnt15b, tot15b = conn.execute(
+    "SELECT member_count, total_size FROM groups WHERE id=%s", (g15,)
+).fetchone()
+assert cnt15b == cnt15 - 1 and tot15b == tot15 - size15, (cnt15, cnt15b, tot15, tot15b)
+try:  # несуществующий file_id — понятная ошибка, а не падение
+    actions.delete_file(str(settings_path), 999999999)
+    raise AssertionError("expected FileOpError")
+except actions.FileOpError:
+    pass
+print("15. web-actions delete: диск + строки БД вычищены, счётчики групп уменьшены OK")
+
+# --- 16) db.wipe_results: «Очистить все» — БД пуста, файлы на диске целы ---
+from engine import db as eng_db
+
+# kept_path берём только у ПОСЛЕДНЕГО run (как в галерее): у групп старых run
+# kept_path может быть «устаревшим» — файл мог быть перенесён более поздним run
+kept16 = conn.execute(
+    "SELECT kept_path FROM groups WHERE run_id=(SELECT max(id) FROM analysis_runs) "
+    "AND kept_path IS NOT NULL ORDER BY id DESC LIMIT 1"
+).fetchone()[0]
+assert Path(kept16).exists()
+conn16 = psycopg.connect(PG_DSN, autocommit=True)
+eng_db.wipe_results(conn16)
+for tbl in ("files", "hashes", "groups", "group_members", "analysis_runs", "events"):
+    n = conn16.execute(f"SELECT count(*) FROM {tbl}").fetchone()[0]
+    assert n == 0, f"{tbl}: осталось {n}"
+st16 = conn16.execute(
+    "SELECT stage, processed, total, stop_requested FROM status WHERE id=1"
+).fetchone()
+assert st16 == ("idle", 0, 0, False), st16
+assert Path(kept16).exists(), "файлы в src не затронуты"
+assert trash.is_dir() and any(trash.iterdir()), "trash с перенесёнными файлами не тронут"
+conn16.close()
+print("16. wipe_results: индекс/группы/журнал пусты, status=idle, файлы на диске целы OK")
 
 conn.close()
 srv.cleanup()  # останавливает сервер и удаляет pgdata

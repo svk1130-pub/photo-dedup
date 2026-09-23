@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -75,6 +76,20 @@ Entry = FileHashes | CorruptFile
 def hamming_distance(a: bytes, b: bytes) -> int:
     """Расстояние Хэмминга между двумя равными по длине байтовыми хэшами."""
     return (int.from_bytes(a, "big") ^ int.from_bytes(b, "big")).bit_count()
+
+
+def file_sha256(path: str, chunk: int = 1 << 20) -> bytes:
+    """Точный sha256 содержимого файла (чанками, экономно по памяти).
+
+    Используется на этапе move для верификации байт-в-байт копий:
+    равенство sha256 гарантирует идентичность файлов независимо от phash
+    и порога Хэмминга. Бросает OSError, если файл недоступен.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(chunk), b""):
+            h.update(blk)
+    return h.digest()
 
 
 def phash_to_bytes(h) -> bytes:

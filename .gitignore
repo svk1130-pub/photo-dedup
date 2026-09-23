@@ -1,5 +1,7 @@
 .my_readme.md
 .tmp/
+src1/
+
 
 __pycache__/
 *.py[cod]

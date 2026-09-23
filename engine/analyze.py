@@ -2,15 +2,19 @@
 
 Перебор бакетов потоковым курсором (cursor(name=...), itersize) — ничего
 не тащим в RAM целиком. Внутри бакета — попарное расстояние Хэмминга по
-полному phash (XOR + popcount; для хэшей ≤64 бит — векторизовано через numpy).
+полному phash (XOR + popcount; для хэшей ≤64 бит — векторизовано через numpy,
+сравнение идёт 2D-блоками с ограниченной памятью).
 
 Группа = транзитивное замыкание через union-find ВНУТРИ бакета
 (A~B, B~C ⇒ одна группа, даже если A!~C). Кандидат — любая пара вариантов
 (file A, variant i) vs (file B, variant j) с дистанцией ≤ threshold.
+Хэши разной длины (смена hash_size без --force) несравнимы и разбиваются
+на независимые подгруппы.
 
 Документированный trade-off: пары, чьи хэши различаются в ПЕРВЫХ
 hash_part_len*4 битах (по умолчанию 16), не попадут в один бакет —
-это осознанное ограничение ради скорости.
+это осознанное ограничение ради скорости. Инвариант: байт-в-байт копии
+всегда имеют одинаковый phash и попадают в один бакет при любом threshold.
 """
 from __future__ import annotations
 
@@ -26,6 +30,7 @@ from psycopg.rows import dict_row
 
 from .db import reset_status, set_stage, update_progress
 from .hashing import hamming_distance
+from .originals import name_penalty
 
 if TYPE_CHECKING:
     from .cli import EngineContext
@@ -74,22 +79,29 @@ class UnionFind:
 def _bucket_pairs(fids: list[int], ints: list[int], threshold: int) -> Iterator[tuple[int, int, int]]:
     """Векторизованный вариант (длина хэша ≤ 8 байт): numpy XOR + bitwise_count.
 
-    Пары обрабатываются блоками строк по всему столбцу с фильтром j > i —
-    каждая пара учитывается ровно один раз, память ограничена блоком.
+    Пары обрабатываются 2D-блоками (строки × столбцы) с фильтром j > i — каждая
+    пара учитывается ровно один раз, память ограничена блоком block×block
+    (~24 МБ при block=1024) независимо от размера бакета. Раньше блок был
+    2048×n на весь бакет и на «плоских» бакетах (десятки тысяч похожих
+    кадров) расходовал гигабайты.
     """
     n = len(ints)
     arr = np.array(ints, dtype=np.uint64)
     fa = np.array(fids, dtype=np.int64)
     col_idx = np.arange(n)
-    block = 2048
+    block = 1024
     for start in range(0, n, block):
         stop = min(start + block, n)
-        xored = arr[start:stop, None] ^ arr[None, :]
-        d = np.bitwise_count(xored)
-        ok = (d <= threshold) & (fa[None, :] != fa[start:stop, None])
-        ok &= col_idx[None, :] > col_idx[start:stop][:, None]
-        for i, j in np.argwhere(ok):
-            yield int(fids[start + i]), int(fids[j]), int(d[i, j])
+        for cstart in range(0, n, block):
+            cstop = min(cstart + block, n)
+            if cstop <= start:  # столбцы целиком левее строк: j > i невозможен
+                continue
+            xored = arr[start:stop, None] ^ arr[None, cstart:cstop]
+            d = np.bitwise_count(xored)
+            ok = (d <= threshold) & (fa[None, cstart:cstop] != fa[start:stop, None])
+            ok &= col_idx[None, cstart:cstop] > col_idx[start:stop][:, None]
+            for i, jj in np.argwhere(ok):
+                yield int(fids[start + i]), int(fids[cstart + jj]), int(d[i, jj])
 
 
 def _bucket_pairs_python(fids: list[int], ints: list[int], threshold: int) -> Iterator[tuple[int, int, int]]:
@@ -104,22 +116,50 @@ def _bucket_pairs_python(fids: list[int], ints: list[int], threshold: int) -> It
                 yield fids[i], fids[j], d
 
 
-def _process_bucket(uf: UnionFind, fids: list[int], ints: list[int],
-                    byte_len: int, threshold: int) -> None:
-    if len(ints) < 2:
+def _process_bucket(uf: UnionFind, rows: list[tuple[int, int, int]], threshold: int) -> None:
+    """rows: (file_id, hash_int, byte_len).
+
+    Хэши РАЗНОЙ длины в одном бакете возможны после смены hash_size без
+    --force (старые 8-байтные строки соседствуют с новыми 16-байтными).
+    Сравнивать их напрямую нельзя — бакет делится на подгруппы равной
+    длины, каждая обрабатывается независимо (раньше смешанный бакет ронял
+    analyze с OverflowError при упаковке в uint64).
+    """
+    if len(rows) < 2:
         return
-    gen = _bucket_pairs(fids, ints, threshold) if byte_len <= 8 else _bucket_pairs_python(fids, ints, threshold)
-    for a, b, d in gen:
-        uf.add(a)
-        uf.add(b)
-        uf.union(a, b, d)
+    by_len: dict[int, tuple[list[int], list[int]]] = {}
+    for fid, val, blen in rows:
+        fids, ints = by_len.setdefault(blen, ([], []))
+        fids.append(fid)
+        ints.append(val)
+    for blen, (fids, ints) in by_len.items():
+        if len(fids) < 2:
+            continue
+        gen = (_bucket_pairs(fids, ints, threshold) if blen <= 8
+               else _bucket_pairs_python(fids, ints, threshold))
+        for a, b, d in gen:
+            uf.add(a)
+            uf.add(b)
+            uf.union(a, b, d)
 
 
 def choose_kept(rows: list[dict], keep_by: str) -> dict:
-    """Выбор «оригинала»: по умолчанию максимальный размер; опция pixels — разрешение.
-    Тай-брейк — лексикографически меньший путь (детерминизм)."""
+    """Выбор «оригинала» группы.
+
+    size — максимальный размер; pixels — максимальное разрешение; capture —
+    время снимка (engine/originals.py): ранний capture_time (заполняется
+    вызывающей стороной на этапе move; здесь, на этапе analyze, подсказка
+    по mtime из БД), тай-брейк — name-penalty («(Copy 2)»/«(1)» проигрывают
+    чистому имени), затем лексикографически меньший путь (детерминизм).
+    """
     if keep_by == "pixels":
         key = lambda r: (-((r["width"] or 0) * (r["height"] or 0)), -r["size"], r["path"])
+    elif keep_by == "capture":
+        def key(r):
+            t = r.get("capture_time")
+            if t is None:
+                t = float(r.get("mtime") or 0.0)
+            return (t, name_penalty(r["path"]), r["path"])
     else:
         key = lambda r: (-r["size"], r["path"])
     return min(rows, key=key)
@@ -130,7 +170,7 @@ def _fetch_files_info(conn, ids: list[int]) -> dict[int, dict]:
     it = iter(ids)
     while chunk := list(itertools.islice(it, 10000)):
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT id, path, size, width, height FROM files WHERE id = ANY(%s)", (chunk,))
+            cur.execute("SELECT id, path, size, mtime, width, height FROM files WHERE id = ANY(%s)", (chunk,))
             for r in cur:
                 out[r["id"]] = r
     return out
@@ -188,14 +228,12 @@ def run_analyze(ctx: "EngineContext") -> tuple[int | None, bool]:
             cur.itersize = 20000
             cur.execute("SELECT hash_part, file_id, phash FROM hashes ORDER BY hash_part")
             cur_part: str | None = None
-            fids: list[int] = []
-            ints: list[int] = []
-            byte_len = 0
+            rows: list[tuple[int, int, int]] = []  # (file_id, hash_int, byte_len)
             for part, fid, ph in cur:
                 if part != cur_part:
-                    _process_bucket(uf, fids, ints, byte_len, threshold)
+                    _process_bucket(uf, rows, threshold)
                     cur_part = part
-                    fids, ints = [], []
+                    rows = []
                     processed += 1
                     now = time.monotonic()
                     if now - last_t >= 0.5:
@@ -207,11 +245,9 @@ def run_analyze(ctx: "EngineContext") -> tuple[int | None, bool]:
                     if ctx.should_stop():
                         stopped = True
                         break
-                fids.append(fid)
-                ints.append(int.from_bytes(bytes(ph), "big"))
-                byte_len = len(ph)
+                rows.append((fid, int.from_bytes(bytes(ph), "big"), len(ph)))
             else:
-                _process_bucket(uf, fids, ints, byte_len, threshold)
+                _process_bucket(uf, rows, threshold)
 
     if stopped:
         with conn.transaction():

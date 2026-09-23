@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import errno
+import os
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -26,8 +28,13 @@ class SettingsError(Exception):
 
 @dataclass(slots=True)
 class PathsConfig:
-    src: Path = Path("/data/src")
-    trash: Path = Path("/data/trash")
+    # src/trash — КОНТЕЙНЕРНЫЕ пути (то, что реально открывает движок/web);
+    # src_host/trash_host — как путь записан в settings.toml (обычно путь ХОСТА,
+    # см. PATH_MAP_* в docker-compose). Дефолты соответствуют маунту /photos.
+    src: Path = Path("/photos/src")
+    trash: Path = Path("/photos/trash")
+    src_host: str = "/photos/src"
+    trash_host: str = "/photos/trash"
 
 
 @dataclass(slots=True)
@@ -52,16 +59,21 @@ class AnalyzeConfig:
 
 @dataclass(slots=True)
 class MoveConfig:
-    mode: str = "auto"        # auto | manual
-    keep_by: str = "size"     # size | pixels
+    mode: str = "auto"          # auto | manual
+    keep_by: str = "capture"    # capture | size | pixels
     conflict: str = "suffix"
     dry_run: bool = False
+    group_name_prefix: str = "_"   # префикс имён папок групп в trash ("" — без префикса)
 
 
 @dataclass(slots=True)
 class UiConfig:
     page_size: int = 15
     refresh_sec: int = 2
+    # Подтверждения опасных действий в UI (можно отключить — действие сразу):
+    confirm_delete_files: bool = True   # удаление файла из trash в галерее
+    confirm_clean_all: bool = True      # «Очистить все» — очистка результатов/журнала
+    confirm_clean_log: bool = True      # очистка журнала
 
 
 @dataclass(slots=True)
@@ -107,15 +119,75 @@ def _to_choice(v: Any, choices: tuple[str, ...]) -> str:
     raise ValueError(f"ожидалось одно из: {', '.join(choices)}")
 
 
+# ----------------------------- маппинг host ↔ container -----------------------------
+#
+# В docker маунты нельзя менять на лету: settings.[paths] хранит пути КАК НА ХОСТЕ
+# (привычно пользователю, редактируется из UI), а движок/web прозрачно переводят их
+# в контейнерные. Корень задаётся один раз в docker-compose/.env (PHOTOS_ROOT):
+#   PATH_MAP_HOST=/home/me/myfotos   PATH_MAP_CONTAINER=/photos
+#   /home/me/myfotos/src  →  /photos/src
+# Если PATH_MAP_HOST пуст — маппинг выключен (пути используются как есть).
+
+def path_map() -> tuple[str, str]:
+    """(host_root, container_root); host_root == "" — маппинг выключен."""
+    return (
+        os.environ.get("PATH_MAP_HOST", "").strip(),
+        os.environ.get("PATH_MAP_CONTAINER", "/photos").strip() or "/photos",
+    )
+
+
+def host_to_container(host_path: str | Path) -> tuple[Path, bool]:
+    """host-путь → контейнерный. Возвращает (путь, был_ли_маппинг).
+
+    Если маппинг включён и путь ВНЕ корня — SettingsError с понятным текстом
+    (иначе движок молча сканировал бы пустой/чужой каталог)."""
+    root, cont = path_map()
+    p = str(host_path).strip()
+    if not root:
+        return Path(p), False
+    r = root.rstrip("/")
+    if r and (p == r or p.startswith(r + "/")):
+        tail = p[len(r):]
+        return Path((cont.rstrip("/") + (tail or "/")) or "/"), True
+    raise SettingsError(
+        f"Путь {p} вне корня PATH_MAP_HOST ({root or 'не задан'}). "
+        f"Укажите путь внутри этого корня (правьте [paths] в settings.toml или UI) "
+        f"либо расширьте маунт в docker-compose.yml (.env: PHOTOS_ROOT)."
+    )
+
+
+def container_to_host(path: str | Path) -> str:
+    """Обратное преобразование для отображения пользователю (маунт → host-путь).
+    Необратимые пути возвращаются как есть."""
+    root, cont = path_map()
+    p = str(path)
+    if not root:
+        return p
+    c = cont.rstrip("/")
+    if c and (p == c or p.startswith(c + "/")):
+        tail = p[len(c):]
+        return (root.rstrip("/") + (tail or "/")) or "/"
+    return p
+
+
+def resolve_paths(cfg: PathsConfig) -> None:
+    """После разбора TOML: src_host/trash_host уже заполнены — вычисляем
+    контейнерные src/trash (идемпотентно: повторный вызов не ломает значения)."""
+    cfg.src, _ = host_to_container(cfg.src_host)
+    cfg.trash, _ = host_to_container(cfg.trash_host)
+
+
 # ----------------------------- применение секций -----------------------------
 
 def _apply_paths(cfg: PathsConfig, raw: dict[str, Any], text: str) -> None:
+    """[paths] хранит host-пути (что видно в файловом менеджере хоста).
+    Контейнерные вычисляются позже в _resolve_paths (после загрузки секции)."""
     for key in ("src", "trash"):
         if key in raw:
             v = raw[key]
             if not isinstance(v, str) or not v.strip():
                 raise _err(text, key, "paths", "ожидалась непустая строка с путём")
-            setattr(cfg, key, Path(v).expanduser())
+            setattr(cfg, f"{key}_host", v.strip())
 
 
 def _apply_scan(cfg: ScanConfig, raw: dict[str, Any], text: str) -> None:
@@ -179,9 +251,17 @@ def _apply_move(cfg: MoveConfig, raw: dict[str, Any], text: str) -> None:
             raise _err(text, "mode", "move", str(e)) from None
     if "keep_by" in raw:
         try:
-            cfg.keep_by = _to_choice(raw["keep_by"], ("size", "pixels"))
+            cfg.keep_by = _to_choice(raw["keep_by"], ("capture", "size", "pixels"))
         except ValueError as e:
             raise _err(text, "keep_by", "move", str(e)) from None
+    if "group_name_prefix" in raw:
+        try:
+            v = raw["group_name_prefix"]
+            if not isinstance(v, str) or len(v) > 32 or any(ord(c) < 32 for c in v):
+                raise ValueError("ожидалась строка до 32 символов без управляющих символов")
+            cfg.group_name_prefix = v
+        except ValueError as e:
+            raise _err(text, "group_name_prefix", "move", str(e)) from None
     if "conflict" in raw:
         try:
             cfg.conflict = _to_choice(raw["conflict"], ("suffix",))
@@ -205,6 +285,12 @@ def _apply_ui(cfg: UiConfig, raw: dict[str, Any], text: str) -> None:
             cfg.refresh_sec = _to_int(raw["refresh_sec"], 1, 3600)
         except ValueError as e:
             raise _err(text, "refresh_sec", "ui", str(e)) from None
+    for key in ("confirm_delete_files", "confirm_clean_all", "confirm_clean_log"):
+        if key in raw:
+            try:
+                setattr(cfg, key, _to_bool(raw[key]))
+            except ValueError as e:
+                raise _err(text, key, "ui", str(e)) from None
 
 
 def _cross_validate(s: Settings) -> None:
@@ -236,7 +322,7 @@ def _apply_overrides(s: Settings, overrides: dict[str, Any]) -> None:
             elif key == "move.mode":
                 s.move.mode = _to_choice(val, ("auto", "manual"))
             elif key == "move.keep_by":
-                s.move.keep_by = _to_choice(val, ("size", "pixels"))
+                s.move.keep_by = _to_choice(val, ("capture", "size", "pixels"))
             elif key == "move.dry_run":
                 s.move.dry_run = _to_bool(val)
             else:
@@ -274,6 +360,7 @@ def load_settings(path: str | Path | None, overrides: dict[str, Any] | None = No
     _apply_analyze(s.analyze, data.get("analyze", {}), text)
     _apply_move(s.move, data.get("move", {}), text)
     _apply_ui(s.ui, data.get("ui", {}), text)
+    resolve_paths(s.paths)   # host-пути → контейнерные (PATH_MAP_* из окружения)
     _cross_validate(s)
     if overrides:
         _apply_overrides(s, overrides)
@@ -283,7 +370,8 @@ def load_settings(path: str | Path | None, overrides: dict[str, Any] | None = No
 def settings_to_dict(s: Settings) -> dict[str, Any]:
     """Плоское представление для UI / JSON (Path → str, tuple → list)."""
     return {
-        "paths": {"src": str(s.paths.src), "trash": str(s.paths.trash)},
+        # paths показываем в host-форме — как в settings.toml и как привычно пользователю
+        "paths": {"src": s.paths.src_host, "trash": s.paths.trash_host},
         "scan": {
             "extensions": list(s.scan.extensions),
             "recursive": s.scan.recursive,
@@ -301,13 +389,28 @@ def settings_to_dict(s: Settings) -> dict[str, Any]:
             "keep_by": s.move.keep_by,
             "conflict": s.move.conflict,
             "dry_run": s.move.dry_run,
+            "group_name_prefix": s.move.group_name_prefix,
         },
-        "ui": {"page_size": s.ui.page_size, "refresh_sec": s.ui.refresh_sec},
+        "ui": {
+            "page_size": s.ui.page_size,
+            "refresh_sec": s.ui.refresh_sec,
+            "confirm_delete_files": s.ui.confirm_delete_files,
+            "confirm_clean_all": s.ui.confirm_clean_all,
+            "confirm_clean_log": s.ui.confirm_clean_log,
+        },
     }
 
 
 def update_settings_file(path: str | Path, updates: dict[str, dict[str, Any]]) -> None:
-    """Атомарно по смыслу: читаем TOML, мерджим секции, пишем обратно (tomli-w).
+    """Атомарная запись: читаем TOML → мерджим секции → временный файл в том же
+    каталоге → fsync → os.replace. os.replace атомарен: движок, перечитывающий
+    настройки на границе этапов (и параллельные сессии UI), видят всегда
+    целостный старый ИЛИ новый файл — разрыва на границе записи не бывает.
+
+    Если os.replace падает с EBUSY/EXDEV (settings.toml смонтирован в контейнер
+    как ФАЙЛОВЫЙ bind-mount — подмена inode поверх mountpoint невозможна),
+    содержимое пишется НА МЕСТО в тот же inode с fsync — все контейнеры,
+    маунтящие этот же host-файл, видят обновление.
 
     ВНИМАНИЕ: комментарии в файле теряются при перезаписи (ограничение tomli-w).
     Несинтаксически-валидный файл НЕ перезаписывается — чтобы не затиреть ручные правки.
@@ -326,11 +429,45 @@ def update_settings_file(path: str | Path, updates: dict[str, dict[str, Any]]) -
             raise SettingsError(f"Не удалось прочитать {p}: {e}") from None
     for sec, kv in updates.items():
         data.setdefault(sec, {}).update(kv)
+    tmp = p.with_name(f".{p.name}.tmp-{os.getpid()}")  # тот же каталог = та же ФС
     try:
-        with open(p, "wb") as f:
+        with open(tmp, "wb") as f:
             tomli_w.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.replace(tmp, p)  # атомарная подмена целостного файла
+        except OSError as e:
+            # EBUSY/EXDEV: settings.toml смонтирован как ФАЙЛОВЫЙ bind-mount —
+            # подмена inode поверх mountpoint невозможна. Пишем НА МЕСТО в тот же
+            # inode (видно всем контейнерам, маунтящим этот же host-файл).
+            # Окно разрыва — мс для файла ~1-2 КБ (один write + fsync).
+            if e.errno not in (errno.EBUSY, errno.EXDEV):
+                raise
+            payload = tmp.read_bytes()
+            try:
+                with open(p, "r+b") as f:
+                    f.seek(0)
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                    f.truncate()
+            except FileNotFoundError:
+                with open(p, "wb") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
     except OSError as e:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise SettingsError(f"Не удалось записать {p}: {e}") from None
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def check_paths(s: Settings) -> None:

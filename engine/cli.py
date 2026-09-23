@@ -82,8 +82,9 @@ class EngineContext:
             "dry_run": s.move.dry_run,
             "keep_by": s.move.keep_by,
             "batch_size": s.scan.batch_size,
-            "src": str(s.paths.src),
-            "trash": str(s.paths.trash),
+            # пути в host-форме (как в settings.toml/на хосте) — понятнее пользователю
+            "src": s.paths.src_host,
+            "trash": s.paths.trash_host,
             "settings_file": self.settings_path,
         }
         if extra:
@@ -117,7 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
     mv = sub.add_parser("move", parents=[common], help="перенос дубликатов в trash")
     mv.add_argument("--dry-run", action="store_true", help="только план, без переноса")
     mv.add_argument("--move-mode", choices=("auto", "manual"), help="auto | manual")
-    mv.add_argument("--keep-by", choices=("size", "pixels"), help="критерий выбора оригинала")
+    mv.add_argument("--keep-by", choices=("capture", "size", "pixels"),
+                    help="критерий выбора оригинала (capture: время снимка — json-Takeout/ФС)")
     mv.add_argument("--group-id", type=int, help="обработать только эту группу (даже без подтверждения)")
 
     run = sub.add_parser("run", parents=[common], help="scan → analyze → move с Resume")
@@ -126,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--threshold", type=int, metavar="N")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--move-mode", choices=("auto", "manual"))
-    run.add_argument("--keep-by", choices=("size", "pixels"))
+    run.add_argument("--keep-by", choices=("capture", "size", "pixels"))
 
     sub.add_parser("status", parents=[common], help="вывести текущий статус в консоль")
     sub.add_parser("stop", parents=[common], help="выставить флаг мягкой остановки")
@@ -213,21 +215,24 @@ def _cmd_light(args: argparse.Namespace) -> int:
         total, processed = int(row["total"] or 0), int(row["processed"] or 0)
         pct = f"{100.0 * processed / total:.1f}%%" if total else "—"
         speed = float(row["files_per_sec"] or 0.0)
+        speed_unit = "бакетов/с" if row["stage"] == "analyze" else "файлов/с"
         eta = ""
         if speed > 0 and row["stage"] in db.WORK_STAGES and total > processed:
             eta = f" | ETA {_fmt_duration((total - processed) / speed)}"
         print(f"Этап:    {row['stage']}")
         print(f"Прогресс: {processed} / {total} ({pct.replace('%%', '%')}){eta}")
-        print(f"Скорость: {speed:.1f} файлов/с")
+        print(f"Скорость: {speed:.1f} {speed_unit}")
         if row["current_file"]:
             print(f"Файл:    {row['current_file']}")
         print(f"PID:     {row['engine_pid']} | stop_requested: {row['stop_requested']}")
         if row["started_at"]:
             print(f"Запуск:  {row['started_at']:%Y-%m-%d %H:%M:%S} | обновлён: {row['updated_at']:%H:%M:%S}")
 
-        files_total = db.scalar(conn, "SELECT count(*) FROM files")
+        files_total = db.scalar(conn, "SELECT count(*) FROM files WHERE status <> 'moved'")
+        moved_files = db.scalar(conn, "SELECT count(*) FROM files WHERE status = 'moved'")
         corrupt = db.scalar(conn, "SELECT count(*) FROM files WHERE status='corrupt'")
-        print(f"Файлов в индексе: {files_total} (битых: {corrupt})")
+        extra = f", перенесено/отсутствует: {moved_files}" if moved_files else ""
+        print(f"Файлов в индексе: {files_total} (битых: {corrupt}{extra})")
         lr = conn.execute(
             "SELECT id, created_at, threshold FROM analysis_runs ORDER BY id DESC LIMIT 1"
         ).fetchone()

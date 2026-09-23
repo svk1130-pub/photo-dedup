@@ -2,11 +2,20 @@
 # Скопируйте в settings.toml и правьте: cp settings.example.toml settings.toml
 # Приоритет: CLI-флаги > settings.toml > встроенные дефолты.
 # ВНИМАНИЕ: сохранение из веб-UI перезаписывает файл БЕЗ комментариев.
+#
+# ПУТИ: указываются как на хост-машине (привычный файловый менеджер) и
+# редактируются прямо из UI. В docker они автоматически переводятся внутрь
+# маунта /photos — хост-корень задаётся один раз в .env (PHOTOS_ROOT), см.
+# docker-compose.yml (PATH_MAP_HOST/PATH_MAP_CONTAINER). Путь вне корня —
+# ошибка валидации при старте движка. Без docker (локальный запуск) пути
+# используются как есть.
+# Хост-корень можно менять только через .env + `docker compose up -d`
+# (маунты docker нельзя менять на лету) — подпапки внутри корня можно менять из UI.
 
 [paths]
-src = "/data/src"       # архив с фотографиями (в docker — маунт ./src)
-trash = "/data/trash"   # куда переносятся дубликаты (в docker — маунт ./trash)
-                        # trash НЕ должен находиться внутри src (валидация при старте движка)
+src = "/home/me/myfotos/src"       # архив с фотографиями (внутри PHOTOS_ROOT)
+trash = "/home/me/myfotos/trash"   # куда переносятся дубликаты (внутри PHOTOS_ROOT)
+                                   # trash НЕ должен находиться внутри src (валидация)
 
 [scan]
 extensions = [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"]
@@ -24,10 +33,20 @@ threshold = 4             # макс. расстояние Хэмминга дл
 
 [move]
 mode = "auto"             # auto | manual; manual — только подтверждённые группы
-keep_by = "size"          # size | pixels — что считать «оригиналом»
-conflict = "suffix"       # коллизии имён внутри group_{id}: суффикс _1, _2…
+keep_by = "capture"       # capture | size | pixels — что считать «оригиналом»
+                          # capture: время снимка — <файл>.json (Google Takeout:
+                          #            photoTakenTime → creationTime) → файловая система
+                          #            (birthtime/mtime) → тай-брейк по «копийным»
+                          #            суффиксам имени ((Copy 2), (1), « — копия», -edited)
+                          # size: максимальный размер; pixels: максимальное разрешение
+group_name_prefix = "_"   # папка группы в trash: префикс + имя файла-оригинала,
+                          # например _IMG_20260914_123649.jpg ("" — без префикса)
+conflict = "suffix"       # коллизии имён внутри папки группы: суффикс _1, _2…
 dry_run = false           # true — только фиксировать план, физически не переносить
 
 [ui]
-page_size = 15            # групп на страницу галереи
+page_size = 15            # групп на странице галереи
 refresh_sec = 2           # интервал автообновления фрагментов монитора/журнала
+confirm_delete_files = true   # диалог перед удалением файла из trash (галерея, 🗑️)
+confirm_clean_all = true      # диалог перед «Очистить все» (результаты прогонов + журнал)
+confirm_clean_log = true      # диалог перед очисткой журнала (🧹)

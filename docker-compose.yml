@@ -1,5 +1,18 @@
 name: photo-dedup
 
+# Хост-корень с фото: папка, внутри которой лежат src/ (архив) и trash/ (дубликаты).
+# Задаётся ОДИН РАЗ здесь (или в .env рядом с compose — см. .env.example); подпапки
+# src/trash правятся из UI (Настройки → paths) и в settings.toml, без пересборки.
+# Пути в settings.[paths] указываются КАК НА ХОСТЕ: /home/me/myfotos/src и т.п.
+x-photos-root: &photos-root ${PHOTOS_ROOT:-./photos}
+
+x-common-env: &common-env
+  PG_DSN: postgresql://photo:photo@db:5432/photo
+  # Маппинг host→container для [paths] settings.toml:
+  #   /home/me/myfotos/src (в настройках) → /photos/src (внутри контейнера)
+  PATH_MAP_HOST: ${PHOTOS_ROOT:-./photos}
+  PATH_MAP_CONTAINER: /photos
+
 services:
   db:
     image: postgres:16-alpine
@@ -21,19 +34,26 @@ services:
 
   # CLI-движок. НЕ автозапускается и не рестартует — используется через:
   #   docker compose run --rm engine run | scan | analyze | move | status | stop
+  # …или кнопками «▶️ Запустить run» / «🔍 Запустить scan» на вкладке «Монитор»
+  # (кнопки стартуют тот же CLI как subprocess внутри web-контейнера).
   engine:
     build: .
-    image: photo-dedup:1.0.0
+    image: photo-dedup:1.4.0
     init: true
     depends_on:
       db:
         condition: service_healthy
     environment:
-      PG_DSN: postgresql://photo:photo@db:5432/photo
+      <<: *common-env
       SETTINGS_PATH: /app/settings.toml
     volumes:
-      - ./src:/data/src          # rw: shutil.move удаляет файл-источник после копии
-      - ./trash:/data/trash      # rw: сюда переносятся дубликаты
+      # ЕДИНЫЙ rw-маунт корня фото: движку rw (перенос из src в trash);
+      # create_host_path: false — явная ошибка вместо молча пустой папки
+      - type: bind
+        source: *photos-root
+        target: /photos
+        bind:
+          create_host_path: false
       - type: bind
         source: ./settings.toml
         target: /app/settings.toml
@@ -41,10 +61,11 @@ services:
         bind:
           create_host_path: false   # не создавать каталог вместо забытого файла — сразу ясная ошибка
 
-  # Streamlit: тонкий клиент. Никогда не запускает движок как subprocess.
+  # Streamlit: монитор и пульт. С 1.4.0 web имеет rw-доступ к фото — это нужно
+  # для кнопок «↩️ Вернуть»/«🗑️ Удалить» в галерее и запуска движка из UI.
   web:
     build: .
-    image: photo-dedup:1.0.0
+    image: photo-dedup:1.4.0
     restart: unless-stopped
     depends_on:
       db:
@@ -52,14 +73,18 @@ services:
     entrypoint: ["streamlit", "run"]
     command: ["web/app.py", "--server.headless=true", "--server.port=8501", "--browser.gatherUsageStats=false"]
     ports:
-      - "8501:8501"
+      - "9501:8501"
     environment:
-      PG_DSN: postgresql://photo:photo@db:5432/photo
+      <<: *common-env
       SETTINGS_PATH: /data/settings.toml   # rw-маунт ТЕГО ЖЕ host-файла settings.toml
       THUMBS_DIR: /data/cache/thumbs
     volumes:
-      - ./src:/data/src:ro       # web только просматривает изображения
-      - ./trash:/data/trash:ro
+      # Тот же единый маунт корня фото, что у engine (rw: возврат/удаление из trash)
+      - type: bind
+        source: *photos-root
+        target: /photos
+        bind:
+          create_host_path: false
       - type: bind
         source: ./settings.toml
         target: /data/settings.toml   # БЕЗ :ro — UI пишет настройки в тот же host-файл

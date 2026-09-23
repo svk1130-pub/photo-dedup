@@ -17,10 +17,11 @@ COPY engine/ ./engine/
 COPY web/ ./web/
 COPY scripts/ ./scripts/
 
-# non-root user; /data/cache — named volume инициализируется правами appuser
+# non-root user; /photos — общий маунт корня фото (src/, trash/), /data/cache —
+# named volume миниатюр; права appuser нужны, чтобы bind-маунт был доступен на запись
 RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin appuser \
-    && mkdir -p /data/src /data/trash /data/cache/thumbs \
-    && chown -R appuser:appuser /data /app
+    && mkdir -p /photos/src /photos/trash /data/cache/thumbs \
+    && chown -R appuser:appuser /data /photos /app
 
 USER appuser
 

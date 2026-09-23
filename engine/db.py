@@ -33,7 +33,7 @@ DDL: tuple[str, ...] = (
         width       INTEGER,
         height      INTEGER,
         indexed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-        status      TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','corrupt')),
+        status      TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','corrupt','moved')),
         error       TEXT
     )
     """,
@@ -48,6 +48,20 @@ DDL: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_hashes_hash_part ON hashes (hash_part)",
     "CREATE INDEX IF NOT EXISTS idx_files_status ON files (status)",
+    # Миграция 1.3.0: статус 'moved' (файл перенесён в trash или исчез из src).
+    # Снимаем любые CHECK-ограничения на status (в старых БД — двухзначный вариант)
+    # и ставим каноническое трёхзначное. Идемпотентно: выполняется при каждом старте.
+    """
+    DO $$ DECLARE r record; BEGIN
+      FOR r IN SELECT conname FROM pg_constraint
+               WHERE conrelid = 'files'::regclass AND contype = 'c'
+                 AND lower(pg_get_constraintdef(oid)) LIKE '%status%' LOOP
+        EXECUTE format('ALTER TABLE files DROP CONSTRAINT %I', r.conname);
+      END LOOP;
+    END $$;
+    """,
+    "ALTER TABLE files ADD CONSTRAINT files_status_check "
+    "CHECK (status IN ('ok','corrupt','moved'))",
     """
     CREATE TABLE IF NOT EXISTS analysis_runs (
         id          BIGSERIAL PRIMARY KEY,
@@ -184,6 +198,28 @@ def request_stop(conn: psycopg.Connection) -> bool:
     with conn.cursor() as cur:
         cur.execute("UPDATE status SET stop_requested = true, updated_at = now() WHERE id = 1")
         return cur.rowcount == 1
+
+
+def wipe_results(conn: psycopg.Connection) -> None:
+    """«Очистить все» (кнопка UI): результаты прежних прогонов + журнал.
+
+    Удаляются: индекс файлов и хэши (files → hashes, group_members каскадно),
+    все runs с группами (analysis_runs → groups) и журнал (events);
+    status сбрасывается в idle. ФАЙЛЫ НА ДИСКЕ не затрагиваются (ни src, ни trash).
+    Одна транзакция; TRUNCATE ... CASCADE снимает зависимые таблицы целиком —
+    быстрее и проще DELETE при больших объёмах."""
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE analysis_runs, files, events RESTART IDENTITY CASCADE")
+            cur.execute(
+                """
+                UPDATE status
+                   SET stage = 'idle', processed = 0, total = 0, current_file = NULL,
+                       files_per_sec = 0, started_at = NULL, updated_at = now(),
+                       engine_pid = NULL, stop_requested = false, params = '{}'::jsonb
+                 WHERE id = 1
+                """
+            )
 
 
 def get_stop_requested(conn: psycopg.Connection) -> bool:
