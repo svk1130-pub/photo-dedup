@@ -1,18 +1,5 @@
 name: photo-dedup
 
-# Хост-корень с фото: папка, внутри которой лежат src/ (архив) и trash/ (дубликаты).
-# Задаётся ОДИН РАЗ здесь (или в .env рядом с compose — см. .env.example); подпапки
-# src/trash правятся из UI (Настройки → paths) и в settings.toml, без пересборки.
-# Пути в settings.[paths] указываются КАК НА ХОСТЕ: /home/me/myfotos/src и т.п.
-x-photos-root: &photos-root ${PHOTOS_ROOT:-./photos}
-
-x-common-env: &common-env
-  PG_DSN: postgresql://photo:photo@db:5432/photo
-  # Маппинг host→container для [paths] settings.toml:
-  #   /home/me/myfotos/src (в настройках) → /photos/src (внутри контейнера)
-  PATH_MAP_HOST: ${PHOTOS_ROOT:-./photos}
-  PATH_MAP_CONTAINER: /photos
-
 services:
   db:
     image: postgres:16-alpine
@@ -33,27 +20,25 @@ services:
       start_period: 5s
 
   # CLI-движок. НЕ автозапускается и не рестартует — используется через:
-  #   docker compose run --rm engine run | scan | analyze | move | status | stop
-  # …или кнопками «▶️ Запустить run» / «🔍 Запустить scan» на вкладке «Монитор»
-  # (кнопки стартуют тот же CLI как subprocess внутри web-контейнера).
+  #   docker compose run --rm engine run | scan | analyze | move | undo | status | stop
   engine:
     build: .
-    image: photo-dedup:1.4.0
+    image: photo-dedup:1.6.1
     init: true
     depends_on:
       db:
         condition: service_healthy
     environment:
-      <<: *common-env
+      PG_DSN: postgresql://photo:photo@db:5432/photo
       SETTINGS_PATH: /app/settings.toml
+      PHOTOS_ROOT: ${PHOTOS_ROOT:-}   # только информативно (журнал/логи)
     volumes:
-      # ЕДИНЫЙ rw-маунт корня фото: движку rw (перенос из src в trash);
-      # create_host_path: false — явная ошибка вместо молча пустой папки
-      - type: bind
-        source: *photos-root
-        target: /photos
-        bind:
-          create_host_path: false
+      # Где лежат фото НА ХОСТЕ — задаёт ОДНА переменная PHOTOS_ROOT в .env
+      # (по умолчанию ./ — папки рядом с docker-compose.yml, как раньше).
+      # Контейнерный путь всегда один и тот же: /data/src и /data/trash —
+      # поэтому [paths] в settings.toml не нужно трогать при переносе архива.
+      - ${PHOTOS_ROOT:-.}/src:/data/src        # rw: shutil.move удаляет файл-источник после копии
+      - ${PHOTOS_ROOT:-.}/trash:/data/trash    # rw: сюда переносятся дубликаты
       - type: bind
         source: ./settings.toml
         target: /app/settings.toml
@@ -61,11 +46,49 @@ services:
         bind:
           create_host_path: false   # не создавать каталог вместо забытого файла — сразу ясная ошибка
 
-  # Streamlit: монитор и пульт. С 1.4.0 web имеет rw-доступ к фото — это нужно
-  # для кнопок «↩️ Вернуть»/«🗑️ Удалить» в галерее и запуска движка из UI.
+  # Job-runner (1.5.0 Ф1 + 1.6.0 Ф2): исполнитель очереди заданий jobs в PostgreSQL.
+  # UI (кнопки ▶️/🔍/🧠/📦/↩️ на Мониторе) ставит задание (INSERT +
+  # pg_notify), runner берёт его атомарно (FOR UPDATE SKIP LOCKED) и выполняет
+  # ТОТ ЖЕ код движка in-process — тот же образ/маунты, БЕЗ docker-сокета и
+  # subprocess (дизайн: docs/WHY_NO_BUTTONS.md §5, вариант A). Пробуждение —
+  # LISTEN/NOTIFY, фоллбэк — опрос раз в RUNNER_POLL_SEC; heartbeat подтверждает
+  # живость, зависшие задания помечаются stale на рестарте (crash-recovery).
+  # CLI `docker compose run --rm engine …` продолжает работать как раньше.
+  runner:
+    build: .
+    image: photo-dedup:1.6.1
+    init: true
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["python", "-m", "engine.runner"]
+    environment:
+      PG_DSN: postgresql://photo:photo@db:5432/photo
+      SETTINGS_PATH: /app/settings.toml
+      PHOTOS_ROOT: ${PHOTOS_ROOT:-}   # только информативно (журнал/логи)
+      RUNNER_POLL_SEC: ${RUNNER_POLL_SEC:-2}         # фоллбэк-опрос очереди
+      RUNNER_HEARTBEAT_SEC: ${RUNNER_HEARTBEAT_SEC:-5}   # метка живости задания
+      RUNNER_STALE_SEC: ${RUNNER_STALE_SEC:-30}      # heartbeat истёк → stale (старт runner'а и UI)
+      RUNNER_RETAIN_JOBS: ${RUNNER_RETAIN_JOBS:-200} # retention истории очереди (после finish)
+    volumes:
+      - ${PHOTOS_ROOT:-.}/src:/data/src        # rw: shutil.move, как у engine
+      - ${PHOTOS_ROOT:-.}/trash:/data/trash    # rw: сюда переносятся дубликаты
+      - type: bind
+        source: ./settings.toml
+        target: /app/settings.toml
+        read_only: true          # runner только читает настройки
+        bind:
+          create_host_path: false
+
+  # Streamlit: тонкий клиент. Движок как subprocess НЕ запускает; выполняет
+  # только точечные файловые операции из engine/webops.py (⭐/📋/↩️/🗑️/undo)
+  # по путям из БД — поэтому src/trash смонтированы rw и операции запрещены,
+  # пока движок работает (guard в UI).
+  # Почему нет кнопки «Запустить движок» через docker-сокет — docs/WHY_NO_BUTTONS.md
   web:
     build: .
-    image: photo-dedup:1.4.0
+    image: photo-dedup:1.6.1
     restart: unless-stopped
     depends_on:
       db:
@@ -73,24 +96,24 @@ services:
     entrypoint: ["streamlit", "run"]
     command: ["web/app.py", "--server.headless=true", "--server.port=8501", "--browser.gatherUsageStats=false"]
     ports:
-      - "9501:8501"
+      - "9501:8501"              # на хосте — http://localhost:9501 (8501 часто занят)
     environment:
-      <<: *common-env
+      PG_DSN: postgresql://photo:photo@db:5432/photo
       SETTINGS_PATH: /data/settings.toml   # rw-маунт ТЕГО ЖЕ host-файла settings.toml
       THUMBS_DIR: /data/cache/thumbs
+      PHOTOS_ROOT: ${PHOTOS_ROOT:-}        # для отображения хост-путей в сайдбаре
+      RUNNER_STALE_SEC: ${RUNNER_STALE_SEC:-30}   # Ф2: порог stale-детекции из UI (как у runner'а)
+      DOCS_DIR: /app/docs
     volumes:
-      # Тот же единый маунт корня фото, что у engine (rw: возврат/удаление из trash)
-      - type: bind
-        source: *photos-root
-        target: /photos
-        bind:
-          create_host_path: false
+      - ${PHOTOS_ROOT:-.}/src:/data/src        # rw: точечные операции webops (⭐/↩️)
+      - ${PHOTOS_ROOT:-.}/trash:/data/trash    # rw: 📋/🗑️/undo из UI
       - type: bind
         source: ./settings.toml
         target: /data/settings.toml   # БЕЗ :ro — UI пишет настройки в тот же host-файл
         bind:
           create_host_path: false
-      - thumbs:/data/cache       # дисковый кэш миниатюр (named volume)
+      - ./docs:/app/docs:ro          # вкладка «Логика» читает LOGIC.md (можно править без пересборки)
+      - thumbs:/data/cache           # дисковый кэш миниатюр (named volume)
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3); sys.exit(0 if r.status==200 else 1)\""]
       interval: 10s

@@ -128,13 +128,19 @@ def fs_capture_time(path: str, st: os.stat_result | None = None) -> tuple[float,
     return mtime, "fs mtime"
 
 
-def capture_time_of(path: str, mtime_db: float | None = None) -> tuple[float, str]:
-    """Полная иерархия: json-sidecar → файловая система → mtime из БД."""
+def capture_time_of(
+    path: str, mtime_db: float | None = None, *, st: os.stat_result | None = None
+) -> tuple[float, str]:
+    """Полная иерархия: json-sidecar → файловая система → mtime из БД.
+
+    st — заранее полученный os.stat_result (вызывающая сторона на этапе move
+    делает один stat на файл и переиспользует его для capture_time и ctime).
+    """
     sc = sidecar_capture_time(path)
     if sc is not None:
         return sc
     try:
-        fsc = fs_capture_time(path)
+        fsc = fs_capture_time(path, st)
     except OSError:
         fsc = None
     if fsc is not None:

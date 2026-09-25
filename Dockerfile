@@ -16,12 +16,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY engine/ ./engine/
 COPY web/ ./web/
 COPY scripts/ ./scripts/
+COPY docs/ ./docs/
 
-# non-root user; /photos — общий маунт корня фото (src/, trash/), /data/cache —
-# named volume миниатюр; права appuser нужны, чтобы bind-маунт был доступен на запись
+# non-root user; /data/cache — named volume инициализируется правами appuser
 RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin appuser \
-    && mkdir -p /photos/src /photos/trash /data/cache/thumbs \
-    && chown -R appuser:appuser /data /photos /app
+    && mkdir -p /data/src /data/trash /data/cache/thumbs \
+    && chown -R appuser:appuser /data /app
 
 USER appuser
 

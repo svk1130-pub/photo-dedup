@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
 from psycopg.rows import dict_row
+from psycopg.types.json import Json
 
 from .db import reset_status, set_stage, update_progress
 from .hashing import CorruptFile, Entry, FileHashes, compute_entry
@@ -34,8 +35,8 @@ if TYPE_CHECKING:  # без циклического импорта в рант�
 logger = logging.getLogger("engine.scan")
 
 UPSERT_FILE = """
-    INSERT INTO files (path, size, mtime, width, height, status, error, indexed_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+    INSERT INTO files (path, size, mtime, width, height, status, error, exif, indexed_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
     ON CONFLICT (path) DO UPDATE SET
         size = EXCLUDED.size,
         mtime = EXCLUDED.mtime,
@@ -43,6 +44,7 @@ UPSERT_FILE = """
         height = EXCLUDED.height,
         status = EXCLUDED.status,
         error = EXCLUDED.error,
+        exif = EXCLUDED.exif,
         indexed_at = now()
 """
 
@@ -142,9 +144,10 @@ def _write_buffer(conn, buffer: list[Entry], existing: dict[str, ExistingFile],
     clear_ids: list[int] = []
     for e in buffer:
         if isinstance(e, FileHashes):
-            file_rows.append((e.path, e.size, e.mtime, e.width, e.height, "ok", None))
+            file_rows.append((e.path, e.size, e.mtime, e.width, e.height, "ok", None,
+                              Json(e.exif) if e.exif else None))
         else:
-            file_rows.append((e.path, e.size, e.mtime, None, None, "corrupt", e.error[:500]))
+            file_rows.append((e.path, e.size, e.mtime, None, None, "corrupt", e.error[:500], None))
         if e.old_id is not None:
             clear_ids.append(e.old_id)
 
@@ -286,7 +289,7 @@ def run_scan(ctx: "EngineContext", *, force: bool = False) -> ScanStats:
                     pool.submit(
                         compute_entry, path, size, mtime,
                         hash_size=s.hash.hash_size, hash_part_len=s.hash.hash_part_len,
-                        old_id=old_id,
+                        old_id=old_id, read_exif=s.scan.read_exif,
                     )
                 )
 

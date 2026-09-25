@@ -207,8 +207,13 @@ def _process_group(ctx: "EngineContext", conn, trash: Path, g: dict, run_id: int
     kept: dict | None = None
     if present:
         for m in present:  # время снимка: json-sidecar → ФС → БД (engine/originals.py)
-            t, src_lbl = capture_time_of(m["path"], m.get("mtime"))
+            try:
+                st = os.stat(m["path"])
+            except OSError:
+                st = None
+            t, src_lbl = capture_time_of(m["path"], m.get("mtime"), st=st)
             m["capture_time"], m["capture_src"] = t, src_lbl
+            m["ctime"] = float(st.st_ctime) if st is not None else None
         kept = choose_kept(present, keep_by)
         dest = trash / unique_name(group_dir_name(kept["path"], prefix, gid), used_names)
 

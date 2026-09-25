@@ -62,6 +62,9 @@ DDL: tuple[str, ...] = (
     """,
     "ALTER TABLE files ADD CONSTRAINT files_status_check "
     "CHECK (status IN ('ok','corrupt','moved'))",
+    # Миграция 1.4.0: EXIF-свойства файла (словарь строк) для окна «Свойства»
+    # в галерее. Заполняется на этапе scan (scan.read_exif) либо лениво из UI.
+    "ALTER TABLE files ADD COLUMN IF NOT EXISTS exif JSONB",
     """
     CREATE TABLE IF NOT EXISTS analysis_runs (
         id          BIGSERIAL PRIMARY KEY,
@@ -118,6 +121,32 @@ DDL: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts DESC)",
+    # Миграция 1.5.0 (Ф1): очередь заданий runner'а. UI/CLI ставят задания
+    # (INSERT + pg_notify), сервис runner забирает их атомарно (FOR UPDATE
+    # SKIP LOCKED) и выполняет in-process — docs/WHY_NO_BUTTONS.md §5 (вариант A).
+    # clean-db в очередь не входит: это прямая операция с подтверждением.
+    """
+    CREATE TABLE IF NOT EXISTS jobs (
+        id            BIGSERIAL PRIMARY KEY,
+        command       TEXT NOT NULL CHECK (command IN ('run','scan','analyze','move','undo')),
+        params        JSONB NOT NULL DEFAULT '{}'::jsonb,
+        state         TEXT NOT NULL DEFAULT 'queued'
+                      CHECK (state IN ('queued','running','done','failed','stopped','stale')),
+        requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        taken_at      TIMESTAMPTZ,
+        finished_at   TIMESTAMPTZ,
+        heartbeat_at  TIMESTAMPTZ,
+        runner_id     TEXT,
+        exit_code     INTEGER,
+        error         TEXT,
+        result        JSONB
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs (state, id)",
+    # Одно «живое» (queued) задание на команду: двойной клик/гонка вкладок
+    # отсекаются на уровне БД, а не только в UI.
+    "CREATE UNIQUE INDEX IF NOT EXISTS uniq_jobs_queued_command "
+    "ON jobs (command) WHERE state = 'queued'",
 )
 
 
@@ -200,28 +229,6 @@ def request_stop(conn: psycopg.Connection) -> bool:
         return cur.rowcount == 1
 
 
-def wipe_results(conn: psycopg.Connection) -> None:
-    """«Очистить все» (кнопка UI): результаты прежних прогонов + журнал.
-
-    Удаляются: индекс файлов и хэши (files → hashes, group_members каскадно),
-    все runs с группами (analysis_runs → groups) и журнал (events);
-    status сбрасывается в idle. ФАЙЛЫ НА ДИСКЕ не затрагиваются (ни src, ни trash).
-    Одна транзакция; TRUNCATE ... CASCADE снимает зависимые таблицы целиком —
-    быстрее и проще DELETE при больших объёмах."""
-    with conn.transaction():
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE analysis_runs, files, events RESTART IDENTITY CASCADE")
-            cur.execute(
-                """
-                UPDATE status
-                   SET stage = 'idle', processed = 0, total = 0, current_file = NULL,
-                       files_per_sec = 0, started_at = NULL, updated_at = now(),
-                       engine_pid = NULL, stop_requested = false, params = '{}'::jsonb
-                 WHERE id = 1
-                """
-            )
-
-
 def get_stop_requested(conn: psycopg.Connection) -> bool:
     return bool(scalar(conn, "SELECT stop_requested FROM status WHERE id = 1"))
 
@@ -247,5 +254,17 @@ def engine_running(conn: psycopg.Connection, stale_sec: float = 15.0) -> bool:
 def scalar(conn: psycopg.Connection, sql: str, params: tuple = ()) -> Any:
     with conn.cursor() as cur:
         cur.execute(sql, params)
-        row = cur.fetchone()
-        return row[0] if row else None
+        return first_value(cur.fetchone())
+
+
+def first_value(row: Any) -> Any:
+    """Первое значение строки результата независимо от row_factory.
+
+    Соединения движка возвращают кортежи, пул web — словари (dict_row);
+    наивный fetchone()[0] на dict-строке даёт KeyError: 0 (регресс 1.6.1).
+    """
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return next(iter(row.values()))
+    return row[0]

@@ -1,4 +1,4 @@
-"""CLI движка: scan / analyze / move / run / status / stop.
+"""CLI движка: scan / analyze / move / run / undo / clean-db / status / stop.
 
 Приложение запускается как `python -m engine.cli <command>` (или через
 ENTRYPOINT контейнера engine). Никогда не стартует UI; UI никогда не стартует
@@ -19,7 +19,7 @@ from typing import Any
 
 import psycopg
 
-from . import db
+from . import db, webops
 from .analyze import run_analyze
 from .events import EventLog
 from .move import MoveError, run_move
@@ -82,9 +82,8 @@ class EngineContext:
             "dry_run": s.move.dry_run,
             "keep_by": s.move.keep_by,
             "batch_size": s.scan.batch_size,
-            # пути в host-форме (как в settings.toml/на хосте) — понятнее пользователю
-            "src": s.paths.src_host,
-            "trash": s.paths.trash_host,
+            "src": str(s.paths.src),
+            "trash": str(s.paths.trash),
             "settings_file": self.settings_path,
         }
         if extra:
@@ -129,6 +128,17 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--move-mode", choices=("auto", "manual"))
     run.add_argument("--keep-by", choices=("capture", "size", "pixels"))
+
+    undo = sub.add_parser(
+        "undo", parents=[common],
+        help="отменить все переносы: файлы из trash → src, затем очистка результатов и журнала",
+    )
+    undo.add_argument("--dry-run", action="store_true", help="только план отмены, без изменений")
+
+    sub.add_parser(
+        "clean-db", parents=[common],
+        help="очистить результаты прогонов и журнал (файлы на диске не трогаются)",
+    )
 
     sub.add_parser("status", parents=[common], help="вывести текущий статус в консоль")
     sub.add_parser("stop", parents=[common], help="выставить флаг мягкой остановки")
@@ -256,6 +266,55 @@ def _cmd_light(args: argparse.Namespace) -> int:
         conn.close()
 
 
+# ----------------------------- обслуживание: undo / clean-db -----------------------------
+
+def _guard_idle(conn) -> int | None:
+    """None если движок не работает, иначе код ошибки (операции при работающем
+    движке могут пересечься с его файловыми операциями — запрещено)."""
+    if db.engine_running(conn, stale_sec=15.0):
+        print("Движок сейчас работает — операция отклонена. Дождитесь завершения "
+              "или выполните `engine stop`.", file=sys.stderr)
+        return 1
+    return None
+
+
+def _run_undo(ctx: EngineContext, *, dry: bool) -> None:
+    conn = ctx.conn
+    rc = _guard_idle(conn)
+    if rc:
+        raise RuntimeError("движок работает — undo отклонён")
+    to_restore, _problems, plan = webops.undo_all(conn, ctx.settings, dry=True)  # всегда сначала план
+    ctx.log.warning(f"undo: к возврату {to_restore} файлов (план: {len(plan)} строк)")
+    for line in plan[:10]:
+        ctx.log.info(f"undo: {line}")
+    if dry:
+        ctx.log.warning("undo: DRY RUN — ничего не изменено")
+        return
+    if to_restore == 0:
+        ctx.log.warning("undo: перенесённых файлов нет — выполняется только очистка БД")
+    restored_done, problems, notes = webops.undo_all(conn, ctx.settings, dry=False)
+    for note in notes[:10]:
+        ctx.log.info(f"undo: {note}")
+    if problems:
+        ctx.log.error(
+            f"undo: возвращено {restored_done}, проблем: {len(problems)} — "
+            "очистка БД ОТЛОЖЕНА до устранения (результаты сохранены):"
+        )
+        for p in problems[:20]:
+            ctx.log.error(f"undo: проблема: {p}")
+        raise MoveError("undo завершён с проблемами — исправьте и повторите")
+    ctx.log.warning(f"undo: завершено: возвращено {restored_done} файлов, БД очищена")
+
+
+def _run_clean_db(ctx: EngineContext) -> None:
+    rc = _guard_idle(ctx.conn)
+    if rc:
+        raise RuntimeError("движок работает — очистка отклонена")
+    # clean_db пишет отчёт в events САМ (после TRUNCATE, как запись-отчёт);
+    # в stdout дублируем без журналирования, иначе запись задвоится
+    print(webops.clean_db(ctx.conn))
+
+
 # ----------------------------- рабочие команды -----------------------------
 
 def _run_all(ctx: EngineContext, *, force: bool) -> None:
@@ -315,8 +374,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         Path(settings.paths.trash).expanduser().mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        ctx.log.error(f"Не удалось создать папку trash {settings.paths.trash}: {e}")
-        return 2
+        # undo не создаёт trash, но и не требует: папка должна уже существовать
+        if args.command != "undo":
+            ctx.log.error(f"Не удалось создать папку trash {settings.paths.trash}: {e}")
+            return 2
 
     ctx.log.info(f"=== engine {args.command} (pid {os.getpid()}) ===")
     try:
@@ -328,6 +389,10 @@ def main(argv: list[str] | None = None) -> int:
             run_move(ctx, group_id=args.group_id)
         elif args.command == "run":
             _run_all(ctx, force=args.force)
+        elif args.command == "undo":
+            _run_undo(ctx, dry=args.dry_run)
+        elif args.command == "clean-db":
+            _run_clean_db(ctx)
     except KeyboardInterrupt:
         db.set_stage(conn_ctl, "stopped")
         ctx.log.warning("Прервано (KeyboardInterrupt) — статус: stopped")

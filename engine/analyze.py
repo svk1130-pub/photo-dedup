@@ -150,7 +150,11 @@ def choose_kept(rows: list[dict], keep_by: str) -> dict:
     время снимка (engine/originals.py): ранний capture_time (заполняется
     вызывающей стороной на этапе move; здесь, на этапе analyze, подсказка
     по mtime из БД), тай-брейк — name-penalty («(Copy 2)»/«(1)» проигрывают
-    чистому имени), затем лексикографически меньший путь (детерминизм).
+    чистому имени), затем РАННИЙ ctime (кейс «скопировали и переименовали
+    в 2.jpg»: копия наследует mtime, но её ctime = момент копирования —
+    позже, чем у оригинала; поле ctime заполняет вызывающая сторона на
+    этапе move, на analyze его нет — все None не меняют порядок), затем
+    лексикографически меньший путь (детерминизм).
     """
     if keep_by == "pixels":
         key = lambda r: (-((r["width"] or 0) * (r["height"] or 0)), -r["size"], r["path"])
@@ -159,7 +163,7 @@ def choose_kept(rows: list[dict], keep_by: str) -> dict:
             t = r.get("capture_time")
             if t is None:
                 t = float(r.get("mtime") or 0.0)
-            return (t, name_penalty(r["path"]), r["path"])
+            return (t, name_penalty(r["path"]), r.get("ctime") or 0.0, r["path"])
     else:
         key = lambda r: (-r["size"], r["path"])
     return min(rows, key=key)

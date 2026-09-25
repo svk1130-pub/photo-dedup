@@ -78,63 +78,42 @@ assert s3b.move.dry_run and s3b.ui.page_size == 30, "replace сохраняет 
 assert not list(Path(good).parent.glob(f".{Path(good).name}.tmp-*")), "временный файл не остаётся"
 print("1h. update_settings_file atomic (tmp + fsync + os.replace) OK")
 
-# 1i. дефолты 1.4.0: подтверждения UI включены; paths в settings_to_dict — host-форма
-from engine.settings import settings_to_dict, host_to_container, container_to_host
+# 1i. запись настроек при EBUSY (settings.toml — точка маунта одиночного файла):
+# os.replace падает «Device or resource busy» → автоматический откат на запись на месте
+import errno as _errno
+import os as _os
 
-s_def = load_settings(None)
-assert s_def.ui.confirm_delete_files and s_def.ui.confirm_clean_all and s_def.ui.confirm_clean_log
-d_def = settings_to_dict(s_def)
-assert d_def["ui"]["confirm_clean_all"] is True
-assert d_def["paths"]["src"] == s_def.paths.src_host, "в dict — host-форма путей"
-print("1i. ui.confirm_* defaults + host-форма путей в settings_to_dict OK")
+import engine.settings as _settings_mod
 
-# 1j. маппинг host↔container: PATH_MAP_*; путь вне корня — ошибка валидации
-import os
+_orig_replace = _os.replace
 
-os.environ["PATH_MAP_HOST"] = "/home/me/myfotos"
-os.environ["PATH_MAP_CONTAINER"] = "/photos"
+
+def _ebusy_replace(src, dst):
+    raise OSError(_errno.EBUSY, "Device or resource busy")
+
+
+_os.replace = _ebusy_replace
 try:
-    load_settings(good)  # там src=/tmp/arch — вне корня /home/me/myfotos
-    raise AssertionError("expected SettingsError: путь вне корня")
-except SettingsError as e:
-    assert "PATH_MAP_HOST" in str(e) and "/tmp/arch" in str(e), str(e)
-with tempfile.NamedTemporaryFile("wb", suffix=".toml", delete=False) as f:
-    tomli_w.dump({"paths": {"src": "/home/me/myfotos/src", "trash": "/home/me/myfotos/trash"}}, f)
-    mapped = f.name
-s_m = load_settings(mapped)
-assert str(s_m.paths.src) == "/photos/src" and str(s_m.paths.trash) == "/photos/trash"
-assert s_m.paths.src_host == "/home/me/myfotos/src", "host-форма сохраняется"
-assert settings_to_dict(s_m)["paths"]["src"] == "/home/me/myfotos/src"
-assert container_to_host("/photos/x/y.jpg") == "/home/me/myfotos/x/y.jpg"
-assert container_to_host("/other/path") == "/other/path", "необратимый путь — как есть"
-assert host_to_container("/home/me/myfotos") == (Path("/photos"), True)
-try:
-    host_to_container("/etc/passwd")
-    raise AssertionError("expected SettingsError")
-except SettingsError:
-    pass
-os.environ.pop("PATH_MAP_HOST")
-os.environ.pop("PATH_MAP_CONTAINER")
-s_id = load_settings(mapped)
-assert str(s_id.paths.src) == "/home/me/myfotos/src", "без маппинга путь используется как есть"
-print("1j. PATH_MAP host↔container (вне корня — ошибка; без env — identity) OK")
-
-# 1k. EBUSY-fallback: os.replace на файловом bind-mount невозможен → запись НА МЕСТО
-import errno
-import engine.settings as eng_settings
-from unittest.mock import patch
-
-
-def _ebusy_replace(src, dst, **kw):
-    raise OSError(errno.EBUSY, "Device or resource busy")
-
-
-with patch.object(eng_settings.os, "replace", side_effect=_ebusy_replace):
     update_settings_file(good, {"ui": {"page_size": 44}})
-s_e = load_settings(good)
-assert s_e.ui.page_size == 44 and s_e.scan.threads == 3, "in-place запись сохраняет merge"
-assert not list(Path(good).parent.glob(f".{Path(good).name}.tmp-*")), "tmp подчищен"
-print("1k. EBUSY-fallback записи settings.toml (файловый bind-mount) OK")
+finally:
+    _os.replace = _orig_replace
+s3c = load_settings(good)
+assert s3c.ui.page_size == 44 and s3c.scan.threads == 3, "EBUSY-fallback: содержимое записано"
+assert not list(Path(good).parent.glob(f".{Path(good).name}.tmp-*")), "tmp убран после fallback"
+print("1i. update_settings_file EBUSY fallback (bind-mount одиночного файла) OK")
+
+# 1j. новые дефолты 1.4.0: scan.read_exif и ui.confirm_*
+s4 = load_settings(None)
+assert s4.scan.read_exif is True
+assert s4.ui.confirm_delete_files is True and s4.ui.confirm_clean_db is True \
+    and s4.ui.confirm_clean_log is True
+with tempfile.NamedTemporaryFile("wb", suffix=".toml", delete=False) as f:
+    tomli_w.dump({"scan": {"read_exif": False}, "ui": {"confirm_clean_db": False}}, f)
+    flags_toml = f.name
+s5 = load_settings(flags_toml)
+assert s5.scan.read_exif is False and s5.ui.confirm_clean_db is False \
+    and s5.ui.confirm_clean_log is True and s5.ui.confirm_delete_files is True
+print("1j. defaults + парсинг scan.read_exif / ui.confirm_* OK")
 
 # ---------- 2. hashing: полная D4-инвариантность ----------
 import numpy as np
@@ -332,9 +311,10 @@ import engine.db as dbmod
 
 assert len(dbmod.DDL) >= 12
 sql = " ".join(dbmod.DDL).upper()
-for table in ("FILES", "HASHES", "ANALYSIS_RUNS", "GROUPS", "GROUP_MEMBERS", "STATUS", "EVENTS"):
+for table in ("FILES", "HASHES", "ANALYSIS_RUNS", "GROUPS", "GROUP_MEMBERS", "STATUS", "EVENTS",
+              "JOBS"):
     assert f"CREATE TABLE IF NOT EXISTS {table}" in sql, table
-print("5. DDL contains all 7 tables OK")
+print("5. DDL contains all 8 tables OK")
 
 # ---------- 6. originals: capture-время, name-penalty, нейминг папок групп ----------
 import json as _json
@@ -445,5 +425,203 @@ assert unique_name("_a.jpg", used) == "_a__2.jpg", "суффикс перед р
 assert unique_name("_A.jpg", set()) == "_A.jpg", "уникальность без учёта регистра"
 assert unique_name("_A.jpg", {"_a.jpg"}) == "_A__2.jpg", "IMG.jpg vs img.jpg — одно имя на macOS/Win"
 print("6f. sanitize/unique/group_dir_name OK")
+
+# 6g. choose_kept capture: тай-брейк по РАННЕМУ ctime (кейс «копия → 2.jpg»)
+T6G = 1789305560.0
+r_orig6g = {"id": 1, "path": "IMG_20260912_163920.jpg", "size": 100, "mtime": T6G,
+            "capture_time": T6G, "ctime": 1000.0}
+r_short6g = {"id": 2, "path": "2.jpg", "size": 100, "mtime": T6G,
+             "capture_time": T6G, "ctime": 2000.0}  # копия создана позже
+assert _ck([r_short6g, r_orig6g], "capture")["id"] == 1, \
+    "ранний ctime бьёт короткое имя (копия создана позже)"
+# без ctime (как на этапе analyze) — прежнее поведение: путь решает детерминированно
+r_nc1 = {"id": 1, "path": "IMG_20260912_163920.jpg", "size": 100, "mtime": T6G, "capture_time": T6G}
+r_nc2 = {"id": 2, "path": "2.jpg", "size": 100, "mtime": T6G, "capture_time": T6G}
+assert _ck([r_nc1, r_nc2], "capture")["id"] == 2
+print("6g. choose_kept ctime tie-break OK")
+
+# ---------- 7. EXIF-свойства (scan.read_exif → files.exif) ----------
+from engine.hashing import extract_exif
+
+p_ex = tmp / "exif_props.jpg"
+im7 = Image.new("RGB", (64, 48), (10, 200, 10))
+ex7 = Image.Exif()
+ex7[271] = "Xiaomi"                 # Make
+ex7[272] = "Redmi Note 13"          # Model
+ex7[306] = "2026:09:12 16:39:20"    # DateTime
+sub7 = ex7.get_ifd(0x8769)
+sub7[36867] = "2026:09:12 16:39:20"  # DateTimeOriginal
+sub7[33434] = (1, 33)                # ExposureTime 1/33
+sub7[33437] = (17, 10)               # FNumber 1.7
+sub7[34855] = 160                    # ISO
+sub7[34850] = 2                      # ExposureProgram = Auto
+sub7[37383] = 2                      # MeteringMode = Center weighted average
+sub7[37385] = 24                     # Flash = auto, did not fire
+sub7[37386] = (53, 10)               # FocalLength 5.3 mm
+im7.save(p_ex, "JPEG", exif=ex7)
+
+ent7 = compute_entry(str(p_ex), p_ex.stat().st_size, p_ex.stat().st_mtime, read_exif=True)
+x = ent7.exif
+assert x is not None
+assert x["imageType"] == "jpeg (JPEG)", x["imageType"]
+assert x["width"] == "64 pixels" and x["height"] == "48 pixels"
+assert x["cameraBrand"] == "Xiaomi" and x["cameraModel"] == "Redmi Note 13"
+assert x["exposureTime"] == "1/33 s", x["exposureTime"]
+assert x["exposureProgram"] == "Auto"
+assert x["apertureValue"] == "F1.7", x["apertureValue"]
+assert x["isoSpeedRating"] == "160"
+assert x["flashFired"] == "No, auto", x["flashFired"]
+assert x["meteringMode"] == "Center weighted average"
+assert x["focalLength"] == "5.3 mm"
+assert x["createdOn"] == "2026-09-12 16:39:20", x["createdOn"]
+print("7a. extract_exif: полный набор свойств (схема окна «Свойства») OK")
+
+# read_exif=False → свойства не читаются; файл без EXIF → createdOn из mtime
+ent7b = compute_entry(str(p_ex), p_ex.stat().st_size, p_ex.stat().st_mtime)
+assert ent7b.exif is None
+plain = tmp / "plain_props.jpg"
+Image.new("RGB", (32, 16), (5, 5, 5)).save(plain, "JPEG")
+plain_mtime = 1700000000.0
+_os.utime(plain, (plain_mtime, plain_mtime))
+ent7c = compute_entry(str(plain), plain.stat().st_size, plain_mtime, read_exif=True)
+xc = ent7c.exif
+assert "cameraBrand" not in xc and "exposureTime" not in xc
+from datetime import datetime as _dt7, timezone as _tz7
+assert xc["createdOn"] == _dt7.fromtimestamp(plain_mtime, tz=_tz7.utc).strftime("%Y-%m-%d %H:%M:%S")
+assert xc["imageType"] == "jpeg (JPEG)"
+print("7b. extract_exif: отключение по флагу + fallback createdOn=mtime OK")
+
+# ---------- 8. webops: папка группы создаётся до переноса (регресс 1.4.3) ----------
+# Кейс из багрепорта: в ручном режиме ⭐/📋 падали с FileNotFoundError, если
+# папки группы в trash ещё нет (штатно: до `engine move` папок не существует).
+# Функциональный тест без БД: fake-conn (транзакции/курсоры — no-op).
+from engine.webops import _demote_to_trash  # noqa: E402
+
+
+class _FakeCur:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, *a, **k):
+        pass
+
+
+class _FakeTx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeConn:
+    def transaction(self):
+        return _FakeTx()
+
+    def cursor(self):
+        return _FakeCur()
+
+
+w8 = Path(tempfile.mkdtemp())
+src8, tr8 = w8 / "src", w8 / "trash"
+src8.mkdir()
+missing_dir = tr8 / "_IMG_20260912_163920.jpg"
+assert not missing_dir.exists(), "предусловие: папки группы ещё нет (кейс багрепорта)"
+f_a = src8 / "2.jpg"
+f_a.write_bytes(b"a" * 10)
+target8 = _demote_to_trash(_FakeConn(), s, {"path": str(f_a), "file_id": 1, "group_id": 5},
+                           missing_dir)
+assert missing_dir.is_dir(), "папка группы должна создаваться автоматически (фикс 1.4.3)"
+assert Path(target8) == missing_dir / "2.jpg" and Path(target8).exists()
+assert not f_a.exists()
+# коллизия имени внутри freshly-created папки (_unique_target по-прежнему работает)
+f_b = src8 / "2.jpg"
+f_b.write_bytes(b"b" * 10)
+target8b = _demote_to_trash(_FakeConn(), s, {"path": str(f_b), "file_id": 2, "group_id": 5},
+                            missing_dir)
+assert Path(target8b).name == "2_1.jpg" and Path(target8b).exists(), target8b
+print("8. webops._demote_to_trash: mkdir папки группы до переноса + коллизии имён OK")
+
+# ---------- 9. пины фиксов 1.4.3 в исходниках (webops + web/app.py) ----------
+# Файловые операции этих путей требуют БД (проверяются integ-тестами на живом
+# PostgreSQL); здесь фиксируем саму структуру исправлений.
+webops_src = (PROJ / "engine" / "webops.py").read_text(encoding="utf-8")
+assert "dest.mkdir(parents=True, exist_ok=True)" in webops_src, \
+    "баг 1: _demote_to_trash обязан создавать папку группы"
+assert 'donor = (new_kept or {}).get("path")' in webops_src, \
+    "баг 1: имя папки — по оригиналу (конвенция move.py), не по переносимому файлу"
+app_src = (PROJ / "web" / "app.py").read_text(encoding="utf-8")
+assert "in_dialog: bool = False" in app_src and 'in_dialog=True' in app_src, \
+    "баги 2+3: режим диалога должен передаваться в _member_action_buttons"
+assert 'arm_key = f"dlgarm_{fid}" if in_dialog else f"delarm_{fid}"' in app_src, \
+    "баг 3: у подтверждения удаления в диалоге — своё состояние (dlgarm_)"
+assert "if not in_dialog and b_info.button" in app_src, \
+    "баг 2: кнопка ℹ️ не рендерится внутри модального окна"
+assert 'return  # подтверждение остаётся ВНУТРИ окна' in app_src, \
+    "баг 3: вооружение 🗑️ в диалоге без полного st.rerun (иначе окно закрывается)"
+assert 'return  # диалог перерисуется сам (семантика фрагмента); rerun закрыл бы окно' in app_src, \
+    "баг 3: отмена ❌ в диалоге без полного st.rerun"
+print("9. source-пины фиксов 1.4.3 (webops mkdir/donor, dialog ℹ️/🗑️) OK")
+
+# ---------- 10. Ф1 job-runner (1.5.0): пины структуры (compose/DDL/runner/UI) ----------
+# Живой цикл очереди проверяется integ-тестом (§18, реальный PostgreSQL);
+# здесь фиксируем структуру: сервис runner, DDL, атомарный взбор, кнопка UI.
+import py_compile
+
+for rel in ("engine/db.py", "engine/jobs.py", "engine/runner.py", "web/app.py"):
+    py_compile.compile(str(PROJ / rel), doraise=True)
+compose_src = (PROJ / "docker-compose.yml").read_text(encoding="utf-8")
+assert 'entrypoint: ["python", "-m", "engine.runner"]' in compose_src, \
+    "Ф1: в compose должен быть сервис runner (entrypoint engine.runner)"
+assert compose_src.count("photo-dedup:1.6.1") == 3, "теги образа engine/web/runner = 1.6.1"
+assert "docker.sock" not in compose_src, "вариант A: docker-сокет нигде не используется"
+db_src15 = (PROJ / "engine" / "db.py").read_text(encoding="utf-8")
+assert "CREATE TABLE IF NOT EXISTS jobs" in db_src15, "Ф1: DDL очереди jobs"
+assert "uniq_jobs_queued_command" in db_src15, "одно queued-задание на команду"
+jobs_src = (PROJ / "engine" / "jobs.py").read_text(encoding="utf-8")
+assert "FOR UPDATE SKIP LOCKED" in jobs_src and "pg_notify" in jobs_src, \
+    "атомарный взбор + мгновенное пробуждение"
+assert "stage = ANY" in jobs_src, "single-flight guard внутри claim_next"
+runner_src = (PROJ / "engine" / "runner.py").read_text(encoding="utf-8")
+assert "LISTEN" in runner_src and "reap_stale" in runner_src \
+    and "_install_signal_handlers" in runner_src, "LISTEN/NOTIFY + crash-recovery + сигналы"
+assert "▶️ Полный прогон" in app_src and "jobq.enqueue" in app_src, \
+    "Ф1/Ф2: кнопки запуска через очередь в Мониторе"
+assert "1.6.1" in (PROJ / "engine" / "__init__.py").read_text(encoding="utf-8")
+print("10. Ф1 job-runner: пины структуры (compose/DDL/jobs/runner/UI) OK")
+
+# ---------- 11. Ф2 (1.6.0): все длинные команды в очереди + stale-детекция + retention ----------
+assert '"🔍 Скан"' in app_src and '"🧠 Анализ"' in app_src and '"📦 Перенос"' in app_src \
+    and '"↩️ Undo"' in app_src, "Ф2: кнопки scan/analyze/move/undo на Мониторе"
+assert '"arm_qundo"' in app_src and "qundo_yes" in app_src, \
+    "Ф2: undo из очереди — с двухфазным подтверждением"
+assert "reap_stale" in app_src and "RUNNER_STALE_SEC" in app_src, \
+    "Ф2: stale-детекция из UI (reap по протухшему heartbeat, порог RUNNER_STALE_SEC)"
+assert "Прогон оборвался" in app_src, "Ф2: подпись «прогон оборвался» + Resume-подсказка"
+assert "def prune" in jobs_src and "RETAIN_JOBS" in jobs_src, "Ф2: retention истории очереди (prune)"
+assert "jobs.prune" in runner_src and "RUNNER_RETAIN_JOBS" in runner_src, \
+    "Ф2: runner ужимает историю после finish (env RUNNER_RETAIN_JOBS)"
+assert "RUNNER_RETAIN_JOBS" in compose_src and "RUNNER_RETAIN_JOBS" in \
+    (PROJ / ".env.example").read_text(encoding="utf-8"), "Ф2: RUNNER_RETAIN_JOBS в compose/.env.example"
+assert "TRUNCATE events, jobs," in webops_src, "Ф2: «Очистить БД» вычищает и историю очереди jobs"
+assert "RUNNER_STALE_SEC" in compose_src.split("  web:")[1], \
+    "Ф2: web-контейнер получает тот же порог stale, что и runner"
+print("11. Ф2: кнопки всех команд + stale-детекция в UI + retention OK")
+
+# ---------- 12. хотфикс 1.6.1: row-factory-агностичные извлечения (пул web — dict_row) ----------
+# Регресс: enqueue делал cur.fetchone()[0]; соединения пула web отдают dict-строки
+# → KeyError: 0 на любой кнопке запуска (INSERT откатывался пулом).
+db_src = (PROJ / "engine" / "db.py").read_text(encoding="utf-8")
+assert "def first_value" in db_src and "isinstance(row, dict)" in db_src, \
+    "1.6.1: db.first_value — извлечение первого столбца для tuple И dict строк"
+assert "return first_value(cur.fetchone())" in db_src, "1.6.1: db.scalar через first_value"
+assert "db.first_value(cur.fetchone())" in jobs_src, "1.6.1: jobs.enqueue без fetchone()[0]"
+assert "first_value(cur.fetchone())" in webops_src, "1.6.1: webops.clean_db без fetchone()[0]"
+assert "pg_errors.UndefinedTable" in app_src, \
+    "1.6.1: _qjob объясняет отсутствие таблицы jobs (runner не стартовал)"
+print("12. хотфикс 1.6.1: first_value (dict_row-пул) + UndefinedTable-подсказка OK")
 
 print("\nALL SMOKE TESTS PASSED")

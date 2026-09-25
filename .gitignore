@@ -1,8 +1,3 @@
-.my_readme.md
-.tmp/
-src1/
-
-
 __pycache__/
 *.py[cod]
 .venv/
@@ -13,3 +8,6 @@ src/
 trash/
 settings.toml
 *.zip
+
+.tmp/
+.my_readme.md

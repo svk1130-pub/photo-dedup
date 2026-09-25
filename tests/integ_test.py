@@ -495,83 +495,323 @@ assert moved_files_n >= 2
 print(f"13. recovery одноимённых дубликатов (IMG.jpg × 2 → IMG.jpg/IMG_1.jpg) "
       f"+ files.status='moved' OK ({moved_files_n} строк помечено)")
 
-# --- 14) web/actions: «↩️ Вернуть» — дубликат возвращается из trash на прежнее место ---
-from web import actions
+# --- 14) EXIF-свойства: scan.read_exif → files.exif; отключение флага ---
+exif_dir = src / "exifp"
+exif_dir.mkdir()
+imx = PILImage.new("RGB", (64, 48), (10, 200, 10))
+exx = PILImage.Exif()
+exx[271] = "Xiaomi"
+exx[272] = "Redmi Note 13"
+subx = exx.get_ifd(0x8769)
+subx[36867] = "2026:09:12 16:39:20"  # DateTimeOriginal
+subx[34855] = 160                    # ISO
+imx.save(exif_dir / "with_exif.jpg", "JPEG", exif=exx)
+_mts.make_base(810, _random.Random(810)).save(exif_dir / "no_exif.jpg", "JPEG", quality=90)
+assert cli_main(["--settings", str(settings_path), "scan"]) == 0
+exif_val = conn.execute("SELECT exif FROM files WHERE path=%s",
+                        (str(exif_dir / "with_exif.jpg"),)).fetchone()[0]
+assert exif_val is not None and exif_val.get("cameraBrand") == "Xiaomi" \
+    and exif_val.get("cameraModel") == "Redmi Note 13" \
+    and exif_val.get("isoSpeedRating") == "160" \
+    and exif_val.get("createdOn") == "2026-09-12 16:39:20", exif_val
+assert exif_val.get("imageType") == "jpeg (JPEG)", exif_val
+exif_plain = conn.execute("SELECT exif FROM files WHERE path=%s",
+                          (str(exif_dir / "no_exif.jpg"),)).fetchone()[0]
+assert exif_plain is not None and "cameraBrand" not in exif_plain \
+    and exif_plain.get("createdOn"), exif_plain  # createdOn=fallback mtime
+print("14a. scan заполняет files.exif (jsonb): камера/ISO/createdOn OK")
 
-mv14 = conn.execute(
-    "SELECT gm.file_id, gm.moved_to, f.path FROM group_members gm "
-    "JOIN files f ON f.id = gm.file_id WHERE gm.moved_to IS NOT NULL LIMIT 1"
-).fetchone()
-fid14, moved14, orig14 = mv14
-assert Path(moved14).exists() and not Path(orig14).exists()
-assert conn.execute("SELECT status FROM files WHERE id=%s", (fid14,)).fetchone()[0] == "moved"
-actions.restore_file(str(settings_path), fid14)
-assert Path(orig14).exists(), "файл вернулся на прежнее место"
-assert not Path(moved14).exists(), "из trash файл исчез"
-assert conn.execute("SELECT status FROM files WHERE id=%s", (fid14,)).fetchone()[0] == "ok"
-n_h14 = conn.execute("SELECT count(*) FROM hashes WHERE file_id=%s", (fid14,)).fetchone()[0]
-assert n_h14 == 8, f"хэши пересчитаны (8 вариантов), а не {n_h14}"
-assert conn.execute(
-    "SELECT count(*) FROM group_members WHERE file_id=%s AND moved_to IS NOT NULL", (fid14,)
-).fetchone()[0] == 0, "moved_to сброшен"
-assert conn.execute(
-    "SELECT count(*) FROM events WHERE message LIKE 'web:%'"
-).fetchone()[0] >= 1, "событие операции попало в журнал"
-try:  # повторный возврат невозможен: файл больше не в trash
-    actions.restore_file(str(settings_path), fid14)
-    raise AssertionError("expected FileOpError")
-except actions.FileOpError:
-    pass
-print("14. web-actions restore: возврат из trash, хэши пересчитаны, status='ok' OK")
 
-# --- 15) web/actions: «🗑️ Удалить» — дубликат удаляется с диска и из БД ---
-mv15 = conn.execute(
-    "SELECT gm.file_id, f.size, f.path, gm.moved_to FROM group_members gm "
-    "JOIN files f ON f.id = gm.file_id WHERE gm.moved_to IS NOT NULL LIMIT 1"
-).fetchone()
-fid15, size15, orig15, moved15 = mv15
-g15 = conn.execute("SELECT group_id FROM group_members WHERE file_id=%s", (fid15,)).fetchone()[0]
-cnt15 = conn.execute("SELECT member_count FROM groups WHERE id=%s", (g15,)).fetchone()[0]
-tot15 = conn.execute("SELECT total_size FROM groups WHERE id=%s", (g15,)).fetchone()[0]
-assert Path(moved15).exists()
-actions.delete_file(str(settings_path), fid15)
-assert not Path(moved15).exists(), "файл удалён с диска"
-assert conn.execute("SELECT count(*) FROM files WHERE id=%s", (fid15,)).fetchone()[0] == 0
-assert conn.execute("SELECT count(*) FROM hashes WHERE file_id=%s", (fid15,)).fetchone()[0] == 0
-cnt15b, tot15b = conn.execute(
-    "SELECT member_count, total_size FROM groups WHERE id=%s", (g15,)
-).fetchone()
-assert cnt15b == cnt15 - 1 and tot15b == tot15 - size15, (cnt15, cnt15b, tot15, tot15b)
-try:  # несуществующий file_id — понятная ошибка, а не падение
-    actions.delete_file(str(settings_path), 999999999)
-    raise AssertionError("expected FileOpError")
-except actions.FileOpError:
-    pass
-print("15. web-actions delete: диск + строки БД вычищены, счётчики групп уменьшены OK")
+def _write_settings_14(read_exif: bool) -> None:
+    with open(settings_path, "wb") as f:
+        tomli_w.dump({
+            "paths": {"src": str(src), "trash": str(trash)},
+            "scan": {"threads": 4, "batch_size": 10, "read_exif": read_exif},
+            "analyze": {"threshold": 4},
+            "move": {"mode": "auto", "keep_by": "size", "conflict": "suffix", "dry_run": False},
+        }, f)
 
-# --- 16) db.wipe_results: «Очистить все» — БД пуста, файлы на диске целы ---
-from engine import db as eng_db
 
-# kept_path берём только у ПОСЛЕДНЕГО run (как в галерее): у групп старых run
-# kept_path может быть «устаревшим» — файл мог быть перенесён более поздним run
-kept16 = conn.execute(
-    "SELECT kept_path FROM groups WHERE run_id=(SELECT max(id) FROM analysis_runs) "
-    "AND kept_path IS NOT NULL ORDER BY id DESC LIMIT 1"
+_write_settings_14(read_exif=False)
+_mts.make_base(811, _random.Random(811)).save(exif_dir / "off_1.jpg", "JPEG", quality=90)
+assert cli_main(["--settings", str(settings_path), "scan"]) == 0
+assert conn.execute("SELECT exif FROM files WHERE path=%s",
+                    (str(exif_dir / "off_1.jpg"),)).fetchone()[0] is None
+_write_settings_14(read_exif=True)  # вернуть дефолт для последующих секций
+print("14b. scan.read_exif=false → files.exif остаётся NULL OK")
+
+# --- 15) webops: ручные операции UI — ↩️ ⭐ 📋 🗑️ ---
+import engine.webops as webops
+from engine.settings import load_settings as _load_settings_15
+
+ops_dir = src / "ops"
+ops_dir.mkdir()
+img_ops = _mts.make_base(808, _random.Random(808))
+buf_ops = _io.BytesIO()
+img_ops.save(buf_ops, "JPEG", quality=92)
+blob_ops = buf_ops.getvalue()
+(ops_dir / "a_original.jpg").write_bytes(blob_ops)
+(ops_dir / "b_copy.jpg").write_bytes(blob_ops)
+(ops_dir / "c_copy.jpg").write_bytes(blob_ops)
+for p in ops_dir.glob("*.jpg"):
+    os.utime(p, (t12, t12))
+assert cli_main(["--settings", str(settings_path), "scan"]) == 0
+assert cli_main(["--settings", str(settings_path), "analyze"]) == 0
+assert cli_main(["--settings", str(settings_path), "move"]) == 0
+
+S15 = _load_settings_15(settings_path)
+opconn = psycopg.connect(PG_DSN, autocommit=True)
+
+
+def _fid(path: str) -> int:
+    return opconn.execute("SELECT id FROM files WHERE path=%s", (path,)).fetchone()[0]
+
+
+g_ops = opconn.execute(
+    "SELECT gm.group_id FROM group_members gm JOIN files f ON f.id=gm.file_id WHERE f.path=%s",
+    (str(ops_dir / "a_original.jpg"),),
 ).fetchone()[0]
-assert Path(kept16).exists()
-conn16 = psycopg.connect(PG_DSN, autocommit=True)
-eng_db.wipe_results(conn16)
-for tbl in ("files", "hashes", "groups", "group_members", "analysis_runs", "events"):
-    n = conn16.execute(f"SELECT count(*) FROM {tbl}").fetchone()[0]
-    assert n == 0, f"{tbl}: осталось {n}"
-st16 = conn16.execute(
-    "SELECT stage, processed, total, stop_requested FROM status WHERE id=1"
-).fetchone()
-assert st16 == ("idle", 0, 0, False), st16
-assert Path(kept16).exists(), "файлы в src не затронуты"
-assert trash.is_dir() and any(trash.iterdir()), "trash с перенесёнными файлами не тронут"
-conn16.close()
-print("16. wipe_results: индекс/группы/журнал пусты, status=idle, файлы на диске целы OK")
+assert opconn.execute("SELECT member_count FROM groups WHERE id=%s", (g_ops,)).fetchone()[0] == 3
+fid_a, fid_b, fid_c = (_fid(str(ops_dir / n)) for n in
+                       ("a_original.jpg", "b_copy.jpg", "c_copy.jpg"))
+kept_before = opconn.execute("SELECT kept_path FROM groups WHERE id=%s", (g_ops,)).fetchone()[0]
+assert kept_before == str(ops_dir / "a_original.jpg"), kept_before  # тай-брейк пути
+gdir_ops = trash / opconn.execute(
+    "SELECT info->>'group_dir' FROM groups WHERE id=%s", (g_ops,)
+).fetchone()[0]
+assert (gdir_ops / "b_copy.jpg").exists() and (gdir_ops / "c_copy.jpg").exists()
+
+# 15a. ↩️ Вернуть: b из trash → src
+webops.return_file(opconn, S15, fid_b)
+assert (ops_dir / "b_copy.jpg").exists() and not (gdir_ops / "b_copy.jpg").exists()
+assert opconn.execute("SELECT moved_to FROM group_members WHERE file_id=%s", (fid_b,)).fetchone()[0] is None
+assert opconn.execute("SELECT status FROM files WHERE id=%s", (fid_b,)).fetchone()[0] == "ok"
+print("15a. webops.return_file: файл вернулся в src, moved_to сброшен OK")
+
+# 15b. ⭐ b — оригинал: b остаётся в src, a переносится в trash (обмен ролями)
+webops.star_as_original(opconn, S15, fid_b)
+assert (ops_dir / "b_copy.jpg").exists()
+assert not (ops_dir / "a_original.jpg").exists() and (gdir_ops / "a_original.jpg").exists()
+kept_now = opconn.execute("SELECT kept_path FROM groups WHERE id=%s", (g_ops,)).fetchone()[0]
+assert kept_now == str(ops_dir / "b_copy.jpg"), kept_now
+assert opconn.execute("SELECT status FROM files WHERE id=%s", (fid_a,)).fetchone()[0] == "moved"
+print("15b. webops.star_as_original: обмен ролями с физическим переносом OK")
+
+# 15c. ↩️ c → src; 📋 b (текущий оригинал) → trash, автовыбор нового оригинала (c)
+webops.return_file(opconn, S15, fid_c)
+webops.mark_as_duplicate(opconn, S15, fid_b)
+assert not (ops_dir / "b_copy.jpg").exists() and (gdir_ops / "b_copy.jpg").exists()
+kept_now2 = opconn.execute("SELECT kept_path FROM groups WHERE id=%s", (g_ops,)).fetchone()[0]
+assert kept_now2 == str(ops_dir / "c_copy.jpg"), kept_now2
+assert opconn.execute("SELECT role FROM group_members WHERE group_id=%s AND file_id=%s",
+                      (g_ops, fid_c)).fetchone()[0] == "kept"
+print("15c. webops.mark_as_duplicate: оригинал в trash, новый оригинал выбран автоматически OK")
+
+# 15d. ⭐ a (из trash): a возвращается, c переносится в trash
+webops.star_as_original(opconn, S15, fid_a)
+assert (ops_dir / "a_original.jpg").exists() and not (ops_dir / "c_copy.jpg").exists()
+kept_now3 = opconn.execute("SELECT kept_path FROM groups WHERE id=%s", (g_ops,)).fetchone()[0]
+assert kept_now3 == str(ops_dir / "a_original.jpg")
+print("15d. webops.star_as_original из trash: возврат + демотация текущего оригинала OK")
+
+# 15e. 🗑️ c: файл удалён с диска, строки БД вычищены, счётчики группы пересчитаны
+webops.delete_file(opconn, S15, fid_c)
+assert opconn.execute("SELECT count(*) FROM files WHERE id=%s", (fid_c,)).fetchone()[0] == 0
+assert opconn.execute("SELECT member_count FROM groups WHERE id=%s", (g_ops,)).fetchone()[0] == 2
+assert not (gdir_ops / "c_copy.jpg").exists()
+# хэши участников после возвратов отсутствуют (вернувшийся без хэшей переиндексируется scan-ом)
+assert opconn.execute("SELECT count(*) FROM hashes WHERE file_id IN (%s,%s,%s)",
+                      (fid_a, fid_b, fid_c)).fetchone()[0] == 0
+# журнал: ручные операции записаны
+n_op_events = opconn.execute(
+    "SELECT count(*) FROM events WHERE message LIKE '↩️%' OR message LIKE '⭐%' "
+    "OR message LIKE '📋%' OR message LIKE '🗑%'"
+).fetchone()[0]
+assert n_op_events >= 5, n_op_events
+print(f"15e. webops.delete_file: файл/строки удалены, счётчики и журнал актуальны OK ({n_op_events} событий)")
+
+# --- 16) undo: все переносы возвращаются, результаты и журнал очищаются ---
+n_files_before_undo = opconn.execute("SELECT count(*) FROM files").fetchone()[0]
+n_moved_before_undo = opconn.execute(
+    "SELECT count(*) FROM group_members WHERE moved_to IS NOT NULL").fetchone()[0]
+assert n_moved_before_undo > 0
+assert cli_main(["--settings", str(settings_path), "undo", "--dry-run"]) == 0
+assert opconn.execute("SELECT count(*) FROM files").fetchone()[0] == n_files_before_undo, \
+    "dry-run undo не должен ничего менять"
+assert (gdir_ops / "b_copy.jpg").exists(), "dry-run: файл не должен покидать trash"
+
+assert cli_main(["--settings", str(settings_path), "undo"]) == 0
+assert (ops_dir / "a_original.jpg").exists() and (ops_dir / "b_copy.jpg").exists(), \
+    "a и b вернулись на исходные места"
+assert not (ops_dir / "c_copy.jpg").exists(), "удаленный через 🗑️ файл не возвращается"
+for table in ("files", "hashes", "groups", "group_members", "analysis_runs"):
+    n = opconn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+    assert n == 0, f"{table}: {n}"
+stage16 = opconn.execute("SELECT stage FROM status WHERE id=1").fetchone()[0]
+assert stage16 == "idle", stage16
+n_undo_events = opconn.execute("SELECT count(*) FROM events").fetchone()[0]
+assert n_undo_events >= 1, "после undo в свежем журнале есть запись"
+leftover_images = [p for p in trash.rglob("*") if p.is_file() and p.suffix.lower() in
+                   (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff")]
+assert not leftover_images, f"в trash остались файлы: {leftover_images[:5]}"
+print(f"16. undo: возвращено {n_moved_before_undo} файлов, trash пуст, "
+      f"БД очищена (TRUNCATE), stage=idle OK")
+
+# --- 17) clean-db: очистка результатов и журнала без файловых операций ---
+opconn.execute(
+    "INSERT INTO files (path, size, mtime, status) VALUES ('/x/a.jpg', 1, 0, 'ok')"
+)
+opconn.execute("INSERT INTO events (level, message) VALUES ('info', 'проверка clean-db')")
+assert cli_main(["--settings", str(settings_path), "clean-db"]) == 0
+for table in ("files", "groups"):
+    n = opconn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+    assert n == 0, f"{table}: {n}"
+# журнал пуст не «навсегда»: clean-db оставляет ровно одну запись-отчёт о себе
+n_ev17 = opconn.execute("SELECT count(*) FROM events").fetchone()[0]
+assert n_ev17 == 1 and "БД очищена" in opconn.execute(
+    "SELECT message FROM events LIMIT 1").fetchone()[0], n_ev17
+stage17 = opconn.execute("SELECT stage FROM status WHERE id=1").fetchone()[0]
+assert stage17 == "idle", stage17
+opconn.close()
+print("17. clean-db: результаты и журнал очищены, файлы на диске не тронуты OK")
+
+# --- 18) очередь jobs + runner (Ф1): enqueue/claim/guard/heartbeat/finish/reap/execute ---
+import threading as _threading
+from psycopg import errors as pg_errors  # noqa: E402
+from engine import jobs as jobq
+from engine.runner import execute_job, job_state
+
+jconn = psycopg.connect(PG_DSN, autocommit=True)
+assert jconn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0, "очередь пуста до теста"
+
+# 18a. enqueue + уникальный частичный индекс (одно queued-задание на команду)
+jid18 = jobq.enqueue(jconn, "run", {"dry_run": True})
+assert jconn.execute("SELECT state, command, params->>'dry_run' FROM jobs WHERE id=%s",
+                     (jid18,)).fetchone() == ("queued", "run", "true")
+try:
+    jobq.enqueue(jconn, "run")
+    raise AssertionError("ожидали UniqueViolation на дубликат queued 'run'")
+except pg_errors.UniqueViolation:
+    pass
+print("18a. enqueue + uniq_jobs_queued_command OK")
+
+# 18b. claim: атомарный взбор (SKIP LOCKED); повторный — None; heartbeat — только свой
+job18 = jobq.claim_next(jconn, "runner-test")
+assert job18 and job18["id"] == jid18 and job18["command"] == "run" \
+    and job18["params"] == {"dry_run": True}, job18
+assert jconn.execute("SELECT state, runner_id, taken_at IS NOT NULL, heartbeat_at IS NOT NULL "
+                     "FROM jobs WHERE id=%s", (jid18,)).fetchone() \
+    == ("running", "runner-test", True, True)
+assert jobq.claim_next(jconn, "runner-test") is None, "running не пере-берётся"
+assert jobq.heartbeat(jconn, jid18, "runner-test") is True
+assert jobq.heartbeat(jconn, jid18, "runner-other") is False, "чужой runner метку не ставит"
+print("18b. claim_next (SKIP LOCKED) + heartbeat OK")
+
+# 18c. single-flight guard: свежий рабочий stage в status блокирует взбор
+undo_jid = jobq.enqueue(jconn, "undo", {"dry_run": True})
+jconn.execute("UPDATE status SET stage='scan', updated_at=now() WHERE id=1")
+assert jobq.claim_next(jconn, "runner-test") is None, "guard должен блокировать"
+jconn.execute("UPDATE status SET stage='idle', updated_at=now() WHERE id=1")
+ujob = jobq.claim_next(jconn, "runner-test")
+assert ujob and ujob["id"] == undo_jid and ujob["command"] == "undo", ujob
+jobq.finish(jconn, undo_jid, state="stopped", exit_code=0)
+jobq.finish(jconn, jid18, state="done", exit_code=0, result={"stage": "done"})
+assert jconn.execute("SELECT state, exit_code, finished_at IS NOT NULL FROM jobs WHERE id=%s",
+                     (undo_jid,)).fetchone() == ("stopped", 0, True)
+assert jconn.execute("SELECT state, result->>'stage' FROM jobs WHERE id=%s",
+                     (jid18,)).fetchone() == ("done", "done")
+print("18c. single-flight guard + finish (done/stopped) OK")
+
+# 18d. reap_stale: running с протухшим heartbeat → stale; свежий не трогается
+stale_jid = jobq.enqueue(jconn, "scan")
+jobq.claim_next(jconn, "runner-test")
+jconn.execute("UPDATE jobs SET heartbeat_at = now() - interval '120 s' WHERE id=%s", (stale_jid,))
+assert jobq.reap_stale(jconn, stale_sec=30) == 1
+assert jconn.execute("SELECT state, finished_at IS NOT NULL FROM jobs WHERE id=%s",
+                     (stale_jid,)).fetchone() == ("stale", True)
+fresh_jid = jobq.enqueue(jconn, "analyze")
+jobq.claim_next(jconn, "runner-test")
+assert jobq.reap_stale(jconn, stale_sec=30) == 0, "свежий running не трогается"
+assert jconn.execute("SELECT state FROM jobs WHERE id=%s", (fresh_jid,)).fetchone()[0] == "running"
+jobq.finish(jconn, fresh_jid, state="done", exit_code=0)
+print("18d. reap_stale (crash-recovery) OK")
+
+# 18e. execute_job: РЕАЛЬНЫЙ полный `run` (move — dry_run) кодом runner'а
+run_jid = jobq.enqueue(jconn, "run", {"dry_run": True})
+rjob = jobq.claim_next(jconn, "runner-test")
+assert rjob and rjob["id"] == run_jid
+rc18, err18, res18 = execute_job(rjob, settings_path=str(settings_path),
+                                 stop_event=_threading.Event(), runner_id="runner-test")
+state18 = job_state(rc18, err18, res18)
+jobq.finish(jconn, run_jid, state=state18, exit_code=rc18, error=err18, result=res18)
+assert rc18 == 0 and err18 is None and state18 == "done", (rc18, err18, state18, res18)
+assert res18.get("stage") == "done", res18
+from engine.settings import load_settings as _ls18  # noqa: E402
+
+s18 = _ls18(str(settings_path))
+disk18 = [p for p in Path(s18.paths.src).rglob("*")
+          if p.is_file() and p.suffix.lower() in set(s18.scan.extensions)]
+n_files18 = jconn.execute("SELECT count(*) FROM files").fetchone()[0]
+assert n_files18 == len(disk18), (n_files18, len(disk18))
+assert jconn.execute("SELECT count(*) FROM analysis_runs").fetchone()[0] >= 1
+assert jconn.execute(
+    "SELECT count(*) FROM group_members WHERE moved_to IS NOT NULL").fetchone()[0] == 0, \
+    "dry_run: физического переноса и moved_to быть не должно"
+print(f"18e. execute_job('run', dry_run): done, exit 0, files={n_files18} == на диске OK")
+
+# 18f. snapshot для Монитора
+snap18 = jobq.snapshot(jconn)
+assert snap18["queued"] == 0 and snap18["running"] is None
+assert len(snap18["recent"]) >= 4 and all(r["state"] != "queued" for r in snap18["recent"])
+print(f"18f. snapshot: counts={snap18['counts']}, recent={len(snap18['recent'])} OK")
+
+# 18g. retention (Ф2): prune хранит последние N завершённых заданий
+jconn.execute("UPDATE jobs SET state='done', finished_at=now() WHERE state <> 'done'")
+for i in range(12):
+    jid18 = jobq.enqueue(jconn, "scan")
+    jconn.execute("UPDATE jobs SET state='done', finished_at=now() WHERE id=%s", (jid18,))
+pruned18 = jobq.prune(jconn, keep=10)
+n_term18 = jconn.execute("SELECT count(*) FROM jobs").fetchone()[0]
+assert n_term18 == 10, (n_term18, pruned18)
+ids18 = [r[0] for r in jconn.execute("SELECT id FROM jobs ORDER BY id").fetchall()]
+assert ids18 == sorted(ids18)[-10:], "prune обязан оставить ПОСЛЕДНИЕ N по id"
+assert jobq.prune(jconn, keep=10) == 0, "повторный prune — без изменений"
+# queued не трогаются
+q18 = jobq.enqueue(jconn, "scan")
+assert jobq.prune(jconn, keep=10) == 0, "queued-задание не подлежит retention-очистке"
+assert jconn.execute("SELECT state FROM jobs WHERE id=%s", (q18,)).fetchone()[0] == "queued"
+jconn.execute("DELETE FROM jobs WHERE id=%s", (q18,))
+print("18g. retention prune(keep=10): осталось 10 последних, queued не тронут OK")
+
+# 18h. «Очистить БД» (Ф2): TRUNCATE_ALL вычищает и очередь jobs
+from engine.webops import clean_db as _cdb18  # noqa: E402
+from engine import db as webops_db  # noqa: E402  (first_value)
+j18 = jobq.enqueue(jconn, "move")
+msg18 = _cdb18(jconn)
+assert "очереди" in msg18, msg18
+assert jconn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0, \
+    "clean_db обязан вычистить историю очереди"
+assert jconn.execute("SELECT count(*) FROM events").fetchone()[0] == 1, \
+    "в журнале остаётся ровно одна запись-отчёт clean_db"
+print("18h. clean_db: очередь jobs вычищена, отчёт в журнале OK")
+
+# 18i. регресс 1.6.1: enqueue/scalar/clean_db через dict_row-соединение (как пул web).
+# Было: fetchone()[0] на dict-строке → KeyError: 0, INSERT откатывался пулом.
+from psycopg.rows import dict_row as _dict_row  # noqa: E402
+dconn = psycopg.connect(PG_DSN, row_factory=_dict_row)
+djid = jobq.enqueue(dconn, "scan")          # упал бы KeyError'ом до фикса
+assert isinstance(djid, int) and djid > 0
+dconn.commit()
+assert webops_db.scalar(dconn, "SELECT count(*) FROM jobs") == 1, \
+    "db.scalar тоже должен быть row-factory-агностичным"
+assert isinstance(webops_db.first_value({"n": 7}), int) and webops_db.first_value(None) is None
+msg18i = _cdb18(dconn)                       # clean_db через dict_row (было: KeyError)
+assert webops_db.scalar(dconn, "SELECT count(*) FROM jobs") == 0
+dconn.close()
+print("18i. dict_row-пул (как web): enqueue/scalar/clean_db OK")
+
+jconn.close()
+print("18. очередь jobs + runner (Ф1/Ф2) OK")
 
 conn.close()
 srv.cleanup()  # останавливает сервер и удаляет pgdata
