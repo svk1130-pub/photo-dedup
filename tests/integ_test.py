@@ -740,8 +740,9 @@ print("18d. reap_stale (crash-recovery) OK")
 run_jid = jobq.enqueue(jconn, "run", {"dry_run": True})
 rjob = jobq.claim_next(jconn, "runner-test")
 assert rjob and rjob["id"] == run_jid
-rc18, err18, res18 = execute_job(rjob, settings_path=str(settings_path),
-                                 stop_event=_threading.Event(), runner_id="runner-test")
+rc18, err18, res18, stop_reason18 = execute_job(rjob, settings_path=str(settings_path),
+                                                stop_event=_threading.Event(), runner_id="runner-test")
+assert stop_reason18 is None, "задание доработало (done) — причины остановки быть не должно"
 state18 = job_state(rc18, err18, res18)
 jobq.finish(jconn, run_jid, state=state18, exit_code=rc18, error=err18, result=res18)
 assert rc18 == 0 and err18 is None and state18 == "done", (rc18, err18, state18, res18)
@@ -880,6 +881,69 @@ assert rc18k == 0, rc18k
 assert jconn.execute("SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0] == 2
 jconn.execute("DELETE FROM jobs WHERE state='queued'")  # будущее не мешает следующим шагам
 print("18k-2. schedule: дубликат rc=1, прошедший/оба флага/битый --at rc=2 OK")
+
+# 18l. 1.10.0: полировка очереди — глобальная пауза, stop_reason, история.
+# Структура (DDL/UI/_stop_reason) — smoke §16; здесь живое поведение на реальном PG.
+assert jconn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0, "очередь пуста после 18k"
+
+# --- пауза: claim_next молчит даже для задания с сошедшим сроком ---
+jid18l = jobq.enqueue(jconn, "scan")
+assert webops_db.get_runner_paused(jconn) is False
+webops_db.set_runner_paused(jconn, True)
+assert webops_db.get_runner_paused(jconn) is True
+assert jobq.claim_next(jconn, "runner-test") is None, "на паузе задание не берётся"
+snap18l = jobq.snapshot(jconn)
+assert snap18l["queued"] == 1 and len(snap18l["queued_jobs"]) == 1, snap18l
+webops_db.set_runner_paused(jconn, False)
+got18l = jobq.claim_next(jconn, "runner-test")
+assert got18l is not None and got18l["id"] == jid18l, "после снятия паузы задание берётся"
+
+# --- stop_reason при остановке «Стоп»: финиш с причиной (расчёт текста — runner) ---
+jconn.execute("UPDATE status SET stop_requested = true WHERE id = 1")
+jobq.finish(jconn, jid18l, state="stopped", exit_code=0,
+            stop_reason="остановлено пользователем (кнопка Стоп)")
+row18l = jconn.execute("SELECT state, error, stop_reason FROM jobs WHERE id=%s", (jid18l,)).fetchone()
+assert row18l == ("stopped", None, "остановлено пользователем (кнопка Стоп)"), row18l
+jconn.execute("UPDATE status SET stop_requested = false WHERE id = 1")
+
+# --- stop_reason при отмене не начатого (cancel_queued) ---
+cjid18l = jobq.enqueue(jconn, "analyze")
+assert jobq.cancel_queued(jconn, cjid18l) is True
+row18l = jconn.execute("SELECT state, stop_reason, error FROM jobs WHERE id=%s", (cjid18l,)).fetchone()
+assert row18l == ("stopped", "отменено пользователем (не начато)",
+                  "отменено пользователем (не начато)"), row18l
+
+# --- stop_reason при crash-recovery (reap_stale) ---
+rjid18l = jobq.enqueue(jconn, "move")
+job18l = jobq.claim_next(jconn, "runner-test")
+assert job18l is not None and job18l["id"] == rjid18l
+jconn.execute("UPDATE jobs SET heartbeat_at = now() - interval '60 seconds' WHERE id=%s", (rjid18l,))
+assert jobq.reap_stale(jconn, stale_sec=30) == 1
+row18l = jconn.execute("SELECT state, stop_reason FROM jobs WHERE id=%s", (rjid18l,)).fetchone()
+assert row18l[0] == "stale" and "прогон оборвался" in row18l[1], row18l
+
+# --- отмена из истории: удаление ОДНОЙ записи; queued удалять нельзя ---
+qjid18l = jobq.enqueue(jconn, "scan")
+assert jobq.delete_finished(jconn, qjid18l) is False, "queued-задание из истории не удаляется"
+assert jobq.delete_finished(jconn, jid18l) is True
+assert jconn.execute("SELECT count(*) FROM jobs WHERE id=%s", (jid18l,)).fetchone()[0] == 0
+assert jobq.delete_finished(jconn, jid18l) is False, "повторное удаление — False"
+
+# --- очистка истории целиком: queued/running не трогаются ---
+n18l = jobq.clear_finished(jconn)
+assert n18l == 2, n18l  # cjid18l (stopped) + rjid18l (stale); queued scan остаётся
+assert jconn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+assert jobq.clear_finished(jconn) == 0, "повторная очистка — 0"
+jconn.execute("DELETE FROM jobs WHERE id=%s", (qjid18l,))  # освободить слот scan
+q2jid18l = jobq.enqueue(jconn, "scan")
+assert jobq.claim_next(jconn, "runner-test")["id"] == q2jid18l
+assert jobq.clear_finished(jconn) == 0, "running не трогается очисткой истории"
+jobq.finish(jconn, q2jid18l, state="done", exit_code=0)
+assert jobq.clear_finished(jconn) == 1
+assert jconn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+jconn.execute("DELETE FROM jobs")
+print("18l. 1.10.0: пауза (claim молчит/снятие), stop_reason (Стоп/отмена/reap), "
+      "история (✖/очистка; queued/running целы) OK")
 
 jconn.close()
 print("18. очередь jobs + runner (Ф1/Ф2) OK")

@@ -23,7 +23,7 @@ services:
   #   docker compose run --rm engine run | scan | analyze | move | undo | status | stop | schedule
   engine:
     build: .
-    image: photo-dedup:1.9.0
+    image: photo-dedup:1.11.0
     init: true
     depends_on:
       db:
@@ -59,7 +59,7 @@ services:
   # CLI `docker compose run --rm engine …` продолжает работать как раньше.
   runner:
     build: .
-    image: photo-dedup:1.9.0
+    image: photo-dedup:1.11.0
     init: true
     restart: unless-stopped
     depends_on:
@@ -93,7 +93,7 @@ services:
   # Почему нет кнопки «Запустить движок» через docker-сокет — docs/WHY_NO_BUTTONS.md
   web:
     build: .
-    image: photo-dedup:1.9.0
+    image: photo-dedup:1.11.0
     restart: unless-stopped
     depends_on:
       db:

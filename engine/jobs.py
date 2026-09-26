@@ -11,9 +11,13 @@ LISTEN/NOTIFY для мгновенного пробуждения. Минус �
              (scheduled_at — Ф3, «не раньше»; None = как можно скорее)
   * UI:      reschedule(conn, job_id, scheduled_at|None) → перенести отсрочку
              cancel_queued(conn, job_id)                 → отменить не начатое
-  * runner:  claim_next(conn, runner_id)              → dict | None (атомарно)
+             delete_finished(conn, job_id)               → убрать запись из истории (1.10.0)
+             clear_finished(conn)                        → очистить историю целиком (1.10.0)
+  * runner:  claim_next(conn, runner_id)              → dict | None (атомарно;
+             молчит и на глобальной паузе очереди — status.runner_paused, 1.10.0)
              heartbeat(conn, job_id, runner_id)       → метка живости ~раз в 5 с
              finish(conn, job_id, state=..., ...)     → итог в историю очереди
+             (stop_reason — почему задание не доработало, 1.10.0)
              reap_stale(conn)                         → crash-recovery на старте
   * UI:      snapshot(conn)                           → блок «Очередь runner» Монитора
 
@@ -76,11 +80,13 @@ def claim_next(conn: psycopg.Connection, runner_id: str, *, guard_sec: float = G
     """Атомарно взять следующее ДОСТУПНОЕ задание; None — брать нечего.
 
     «Недоступно» — это: (а) очередь пуста, (б) движок уже работает (single-flight
-    guard: свежий рабочий этап в status — выполняется CLI-прогон или задание) и
+    guard: свежий рабочий этап в status — выполняется CLI-прогон или задание),
     (в) Ф3: задание отложено на будущее (scheduled_at > now() — runner молчит
-    до срока, точность старта ≈ RUNNER_POLL_SEC). FOR UPDATE SKIP LOCKED делает
-    взбор безопасным даже при нескольких runner'ах: одна строка достаётся ровно
-    одному. Транзакция короткая (миллисекунды).
+    до срока, точность старта ≈ RUNNER_POLL_SEC) и (г) 1.10.0: глобальная пауза
+    очереди (status.runner_paused) — runner молчит, задания (в т.ч. сошедшие
+    срок) ждут; выполняемое на момент включения паузы задание дорабатает.
+    FOR UPDATE SKIP LOCKED делает взбор безопасным даже при нескольких runner'ах:
+    одна строка достаётся ровно одному. Транзакция короткая (миллисекунды).
     """
     with conn.transaction():
         with conn.cursor() as cur:
@@ -91,6 +97,10 @@ def claim_next(conn: psycopg.Connection, runner_id: str, *, guard_sec: float = G
             )
             if cur.fetchone() is not None:
                 return None  # движок уже работает — single-flight
+            cur.execute("SELECT runner_paused FROM status WHERE id = 1")
+            prow = cur.fetchone()
+            if prow is not None and bool(db.first_value(prow)):
+                return None  # глобальная пауза очереди (1.10.0) — задания ждут
             cur.execute(
                 """
                 UPDATE jobs j
@@ -130,7 +140,8 @@ def cancel_queued(conn: psycopg.Connection, job_id: int) -> bool:
     """Отменить ещё не начатое задание: queued → stopped («не начато», Ф3).
 
     Задание никогда не выполнялось — файлов это не касается, только строка
-    очереди (в истории: state=stopped, error=«отменено пользователем…»).
+    очереди (в истории: state=stopped, stop_reason=«отменено пользователем…»,
+    1.10.0; error остаётся для совместимости со старыми читателями истории).
     Слот uniq-индекса освобождается — ту же команду можно поставить снова.
     False — задание уже не queued (отменять поздно; выполняемое останавливается
     кнопкой Стоп).
@@ -140,7 +151,8 @@ def cancel_queued(conn: psycopg.Connection, job_id: int) -> bool:
             """
             UPDATE jobs
                SET state = 'stopped', finished_at = now(), exit_code = NULL,
-                   error = coalesce(error, 'отменено пользователем (не начато)')
+                   error = coalesce(error, 'отменено пользователем (не начато)'),
+                   stop_reason = coalesce(stop_reason, 'отменено пользователем (не начато)')
              WHERE id = %s AND state = 'queued'
             """,
             (job_id,),
@@ -167,8 +179,14 @@ def finish(
     exit_code: int,
     error: str | None = None,
     result: dict[str, Any] | None = None,
+    stop_reason: str | None = None,
 ) -> None:
-    """Записать итог задания в историю очереди (jobs.error обрезается до 2000)."""
+    """Записать итог задания в историю очереди (jobs.error обрезается до 2000).
+
+    stop_reason (1.10.0) — почему задание не доработало (для state='stopped':
+    отменено/Стоп/сигнал; для stale текст ставит reap_stale). error — про
+    ошибки (failed); в UI история показывает stop_reason или error.
+    """
     if state not in TERMINAL_STATES:
         raise ValueError(f"итоговое состояние задания должно быть одним из {TERMINAL_STATES}, got '{state}'")
     err_text = str(error)[:2000] if error else None
@@ -177,10 +195,10 @@ def finish(
             """
             UPDATE jobs
                SET state = %s, finished_at = now(), exit_code = %s,
-                   error = %s, result = %s
+                   error = %s, result = %s, stop_reason = %s
              WHERE id = %s
             """,
-            (state, int(exit_code), err_text, Json(result or {}), job_id),
+            (state, int(exit_code), err_text, Json(result or {}), stop_reason, job_id),
         )
 
 
@@ -196,12 +214,35 @@ def reap_stale(conn: psycopg.Connection, *, stale_sec: float = 30.0) -> int:
             """
             UPDATE jobs
                SET state = 'stale', finished_at = now(),
-                   error = coalesce(error, 'прогон оборвался: runner перезапущен, heartbeat истёк')
+                   error = coalesce(error, 'прогон оборвался: runner перезапущен, heartbeat истёк'),
+                   stop_reason = coalesce(stop_reason, 'прогон оборвался: runner перезапущен, heartbeat истёк')
              WHERE state = 'running'
                AND (heartbeat_at IS NULL OR heartbeat_at < now() - make_interval(secs => %s))
             """,
             (stale_sec,),
         )
+        return cur.rowcount
+
+
+def delete_finished(conn: psycopg.Connection, job_id: int) -> bool:
+    """Удалить ОДНУ запись из истории очереди (1.10.0, «отмена из истории»)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM jobs WHERE id = %s AND state = ANY(%s)",
+            (job_id, list(TERMINAL_STATES)),
+        )
+        return cur.rowcount == 1
+
+
+def clear_finished(conn: psycopg.Connection) -> int:
+    """Очистить историю очереди ЦЕЛИКОМ (1.10.0) → число удалённых записей.
+
+    queued/running не трогаются (у них нет finished_at) — пауза и выполнение
+    не зависят от чистки истории. Retention (prune) продолжает работать как
+    раньше: история снова растёт с нуля до RUNNER_RETAIN_JOBS.
+    """
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM jobs WHERE state = ANY(%s)", (list(TERMINAL_STATES),))
         return cur.rowcount
 
 
@@ -242,7 +283,7 @@ def snapshot(conn: psycopg.Connection) -> dict[str, Any]:
         )
         running = cur.fetchone()
         cur.execute(
-            "SELECT id, command, state, exit_code, error, requested_at, taken_at, finished_at "
+            "SELECT id, command, state, exit_code, error, stop_reason, requested_at, taken_at, finished_at "
             "FROM jobs WHERE state <> 'queued' ORDER BY id DESC LIMIT 5"
         )
         recent = cur.fetchall()

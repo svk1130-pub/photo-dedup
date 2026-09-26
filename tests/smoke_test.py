@@ -576,7 +576,7 @@ for rel in ("engine/db.py", "engine/jobs.py", "engine/runner.py", "web/app.py"):
 compose_src = (PROJ / "docker-compose.yml").read_text(encoding="utf-8")
 assert 'entrypoint: ["python", "-m", "engine.runner"]' in compose_src, \
     "Ф1: в compose должен быть сервис runner (entrypoint engine.runner)"
-assert compose_src.count("photo-dedup:1.9.0") == 3, "теги образа engine/web/runner = 1.9.0"
+assert compose_src.count("photo-dedup:1.11.0") == 3, "теги образа engine/web/runner = 1.11.0"
 assert "docker.sock" not in compose_src, "вариант A: docker-сокет нигде не используется"
 db_src15 = (PROJ / "engine" / "db.py").read_text(encoding="utf-8")
 assert "CREATE TABLE IF NOT EXISTS jobs" in db_src15, "Ф1: DDL очереди jobs"
@@ -590,7 +590,7 @@ assert "LISTEN" in runner_src and "reap_stale" in runner_src \
     and "_install_signal_handlers" in runner_src, "LISTEN/NOTIFY + crash-recovery + сигналы"
 assert "▶️ Полный прогон" in app_src and "jobq.enqueue" in app_src, \
     "Ф1/Ф2: кнопки запуска через очередь в Мониторе"
-assert "1.9.0" in (PROJ / "engine" / "__init__.py").read_text(encoding="utf-8")
+assert "1.11.0" in (PROJ / "engine" / "__init__.py").read_text(encoding="utf-8")
 print("10. Ф1 job-runner: пины структуры (compose/DDL/jobs/runner/UI) OK")
 
 # ---------- 11. Ф2 (1.6.0): все длинные команды в очереди + stale-детекция + retention ----------
@@ -732,5 +732,85 @@ for _args in (_NS19(at="x", delay="y"), _NS19(at=None, delay=None)):
     except ValueError:
         pass
 print("15. 1.9.0 CLI schedule: подкоманда + парсеры --at/--delay + TZ + uniq-дубликат OK")
+
+# ---------- 16. 1.10.0: полировка очереди — пауза/причина остановки/история ----------
+# Живое поведение (пауза в claim_next, stop_reason при отмене/reap/финиша,
+# удаление из истории) — integ §18l на реальном PostgreSQL; здесь структура.
+db_src = (PROJ / "engine" / "db.py").read_text(encoding="utf-8")
+assert "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS stop_reason TEXT" in db_src, \
+    "1.10.0: миграция jobs.stop_reason (причина остановки — отдельное поле, не error)"
+assert "ALTER TABLE status ADD COLUMN IF NOT EXISTS runner_paused BOOLEAN NOT NULL DEFAULT false" in db_src, \
+    "1.10.0: миграция status.runner_paused (глобальная пауза в БД — переживает рестарты)"
+assert "def set_runner_paused" in db_src and "def get_runner_paused" in db_src, \
+    "1.10.0: флаг паузы пишется/читается как request_stop — просто UPDATE строки статуса"
+jobs_src = (PROJ / "engine" / "jobs.py").read_text(encoding="utf-8")
+assert "SELECT runner_paused FROM status WHERE id = 1" in jobs_src \
+    and "глобальная пауза очереди (1.10.0) — задания ждут" in jobs_src, \
+    "1.10.0: claim_next молчит на паузе (после single-flight, до взбора задания)"
+assert "stop_reason = coalesce(stop_reason, 'отменено пользователем (не начато)')" in jobs_src, \
+    "1.10.0: отмена не начатого пишет и stop_reason (error остаётся для совместимости)"
+assert "stop_reason = coalesce(stop_reason, 'прогон оборвался: runner перезапущен, heartbeat истёк')" in jobs_src, \
+    "1.10.0: reap_stale пишет stop_reason (crash-recovery объясняет обрыв)"
+assert "stop_reason: str | None = None" in jobs_src, "1.10.0: finish принимает stop_reason"
+assert "def delete_finished" in jobs_src and "def clear_finished" in jobs_src, \
+    "1.10.0: отмена из истории — удаление записи/очистка истории"
+assert "state = ANY(%s)" in jobs_src and "TERMINAL_STATES" in jobs_src, \
+    "1.10.0: удаление только завершённых (queued/running не трогаются)"
+assert "error, stop_reason, requested_at" in jobs_src, \
+    "1.10.0: snapshot отдаёт stop_reason для истории Монитора"
+runner_src = (PROJ / "engine" / "runner.py").read_text(encoding="utf-8")
+assert "def _stop_reason" in runner_src, "1.10.0: причина остановки вычисляется в runner"
+assert 'return "остановлено пользователем (кнопка Стоп)"' in runner_src, \
+    "1.10.0: флаг stop_requested в БД приоритетен — «Стоп» распознаётся"
+assert 'return "остановлено сигналом (SIGINT/SIGTERM — контейнер runner остановлен)"' in runner_src, \
+    "1.10.0: сигнал без флага в БД — своя причина"
+assert "result.get(\"stage\") != \"stopped\"" in runner_src, \
+    "1.10.0: stop_reason только для остановленных (done/failed — без причины)"
+assert "stop_reason=stop_reason" in runner_src, "1.10.0: runner передаёт stop_reason в finish"
+app_src = (PROJ / "web" / "app.py").read_text(encoding="utf-8")
+assert "engine_pid, stop_requested, runner_paused, params," in app_src, \
+    "1.10.0: engine_row читает runner_paused (строка статуса уже есть в фрагменте)"
+assert "⏸ Пауза очереди" in app_src and "▶️ Возобновить очередь" in app_src, \
+    "1.10.0: переключатель паузы в блоке очереди Монитора"
+assert "UPDATE status SET runner_paused = %s" in app_src, \
+    "1.10.0: пауза — как «Стоп»: тонкий клиент пишет только флаг в БД"
+assert "(due_queued and not paused)" in app_src, \
+    "1.10.0: на паузе срочные queued-задания не блокируют кнопки запуска (ждут снятия)"
+assert '"arm_hclear"' in app_src and "🧹 Очистить" in app_src, \
+    "1.10.0: очистка истории — с подтверждением (arm-паттерн, как у Undo)"
+assert 'key=f"hdel_{r[\'id\']}"' in app_src, "1.10.0: удаление ОДНОЙ записи истории — кнопка ✖"
+assert 'jobq.clear_finished(conn)' in app_src and "jobq.delete_finished(conn" in app_src, \
+    "1.10.0: UI вызывает jobs.delete_finished/clear_finished (без прямой SQL в истории)"
+assert 'r["stop_reason"] or r["error"]' in app_src, \
+    "1.10.0: история показывает stop_reason или error (записи до 1.10.0)"
+print("16. 1.10.0 полировка очереди: пауза (DDL/claim/UI), stop_reason (finish/reap/отмена), история (✖/очистка) OK")
+
+# ---------- 17. 1.11.0: тема оформления (тёмная/светлая) + CHANGELOG.md ----------
+# Тема — инжектируемый CSS (streamlit 1.45 не умеет тему в рантайме); живой рендер
+# проверяется AppTest (scripts/apptest_111.py); здесь — структурные пины.
+assert "THEME_DARK_CSS" in app_src, "1.11.0: CSS-константа тёмной темы"
+assert "data-baseweb=\"calendar\"" in app_src, "1.11.0: тема перекрашивает календарь st.date_input"
+assert "color-scheme: dark" in app_src, "1.11.0: нативные контролы под тёмную схему"
+# seed ДО создания виджета: _resolve_theme определён и вызывается в main() до _banner
+assert 'st.session_state["theme_dark"] = st.query_params.get(THEME_QP) == "dark"' in app_src, \
+    "1.11.0: seed темы из ?theme= (переживает F5)"
+assert app_src.index("def _resolve_theme") < app_src.index("def _sidebar"), \
+    "1.11.0: _resolve_theme объявлен до _sidebar (seed до виджета с key)"
+assert app_src.index("_inject_theme(_resolve_theme())") < app_src.index("_banner(row)"), \
+    "1.11.0: инжекция CSS в начале main() — до баннера и экрана «БД недоступна»"
+assert 'st.toggle(\n            "🌙 Тёмная тема", key="theme_dark",' in app_src, \
+    "1.11.0: переключатель темы — вверху сайдбара (key=theme_dark)"
+assert 'st.query_params[THEME_QP] = "dark" if dark else "light"' in app_src, \
+    "1.11.0: выбор темы отражается в адресе страницы (?theme=dark|light)"
+assert "if dark:\n        st.markdown(f\"<style>{THEME_DARK_CSS}</style>\", unsafe_allow_html=True)" in app_src, \
+    "1.11.0: светлая тема без инжекции (дефолтный вид без регрессий)"
+# CHANGELOG.md: есть, покрывает версии, в README добавлен в структуру §11
+changelog = (PROJ / "CHANGELOG.md").read_text(encoding="utf-8")
+for v in ("1.11.0", "1.10.0", "1.9.0", "1.8.0", "1.7.1", "1.7.0", "1.6.1", "1.6.0",
+          "1.5.0", "1.4.3", "1.4.2", "1.4.1", "1.4.0", "1.3.0", "1.2.0", "1.1.0", "1.0.0"):
+    assert f"## {v} —" in changelog, f"CHANGELOG.md: нет секции {v}"
+assert "CHANGELOG.md            # сводка изменений по версиям" in (PROJ / "README.md").read_text(encoding="utf-8"), \
+    "1.11.0: CHANGELOG.md отражён в структуре проекта (README §11)"
+print("17. 1.11.0 тема (CSS/seed/toggle/query-params/светлая без инжекции) + CHANGELOG.md OK")
 
 print("\nALL SMOKE TESTS PASSED")

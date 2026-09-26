@@ -16,11 +16,15 @@ heartbeat'ом из отдельного потока; на старте runner'
 
 Остановка: кнопка «🛑 Стоп» в UI работает как раньше (тот же флаг
 status.stop_requested): движок доделывает текущий файл/батч, задание получает
-state='stopped'. SIGTERM контейнера — та же мягкая остановка; повторный
-сигнал — принудительный выход (docker restart поднимет runner, задание
-станет stale).
+state='stopped' и stop_reason «остановлено пользователем» (1.10.0; сигнал
+SIGINT/SIGTERM даёт свой текст — причину видно в истории очереди). SIGTERM
+контейнера — та же мягкая остановка; повторный сигнал — принудительный выход
+(docker restart поднимет runner, задание станет stale).
 
-CLI-путь `docker compose run --rm engine run|scan|…` не меняется.
+Глобальная пауза очереди (1.10.0): флаг status.runner_paused (кнопка UI) —
+claim_next молчит, задания (в т.ч. отложенные) ждут в очереди; выполняемое
+задание дорабатает штатно. CLI-путь `docker compose run --rm engine run|scan|…`
+не меняется.
 """
 from __future__ import annotations
 
@@ -85,17 +89,39 @@ def _status_snapshot(conn_ctl: psycopg.Connection) -> dict[str, Any]:
     }
 
 
+def _stop_reason(result: dict[str, Any], conn_ctl: psycopg.Connection, stop_event: threading.Event) -> str | None:
+    """Почему задание не доработало (1.10.0) — текст для jobs.stop_reason.
+
+    Различаем по доступным признакам: флаг stop_requested в БД выставлен —
+    «Стоп» (UI/CLI stop); иначе если локальный stop_event поднят — сигнал
+    (SIGINT/SIGTERM: docker stop/рестарт контейнера); иначе остановка без
+    уточнённой причины (встраивание/KeyboardInterrupt вне обработчика).
+    Флаг в БД приоритетен: Стоп мог сопровождаться и сигналом рестарта.
+    """
+    if result.get("stage") != "stopped":
+        return None  # задание доработало (done/failed) — причины остановки нет
+    try:
+        if db.get_stop_requested(conn_ctl):
+            return "остановлено пользователем (кнопка Стоп)"
+    except psycopg.Error:  # undo/clean-db могли вычистить БД — не критично
+        pass
+    if stop_event.is_set():
+        return "остановлено сигналом (SIGINT/SIGTERM — контейнер runner остановлен)"
+    return "остановлено (причина не уточнена)"
+
+
 def execute_job(
     job: dict[str, Any],
     *,
     settings_path: str,
     stop_event: threading.Event,
     runner_id: str,
-) -> tuple[int, str | None, dict[str, Any]]:
+) -> tuple[int, str | None, dict[str, Any], str | None]:
     """Выполнить задание in-process: тот же код, что у CLI, без argparse.
 
-    Возвращает (exit_code, error | None, result) — rc зеркалит cli.main
-    (0 ок / 2 конфигурация / 3 нет БД / 1 ошибка этапа).
+    Возвращает (exit_code, error | None, result, stop_reason | None) —
+    rc зеркалит cli.main (0 ок / 2 конфигурация / 3 нет БД / 1 ошибка этапа);
+    stop_reason (1.10.0) непуст только для остановленных заданий (stage='stopped').
     """
     command, params = job["command"], dict(job.get("params") or {})
     overrides = _params_to_overrides(params)
@@ -160,9 +186,10 @@ def execute_job(
         rc, error = 1, f"{type(e).__name__}: {e}"
     finally:
         result = _status_snapshot(conn_ctl)
+        stop_reason = _stop_reason(result, conn_ctl, stop_event)
         conn.close()
         conn_ctl.close()
-    return rc, error, result
+    return rc, error, result, stop_reason
 
 
 def job_state(rc: int, error: str | None, result: dict[str, Any]) -> str:
@@ -256,15 +283,17 @@ def main() -> int:
             stop_event.clear()
             logger.info("задание #%d: %s %s", job["id"], job["command"], job["params"] or "")
             with _heartbeat(job["id"], runner_id):
-                rc, error, result = execute_job(
+                rc, error, result, stop_reason = execute_job(
                     job, settings_path=settings_path, stop_event=stop_event, runner_id=runner_id,
                 )
             state = job_state(rc, error, result)
-            jobs.finish(conn, job["id"], state=state, exit_code=rc, error=error, result=result)
+            jobs.finish(conn, job["id"], state=state, exit_code=rc, error=error,
+                        result=result, stop_reason=stop_reason)
             pruned = jobs.prune(conn, keep=RETAIN_JOBS)  # retention: история очереди не растёт бесконечно
             logger.info(
                 "задание #%d завершено: %s (exit %d)%s",
-                job["id"], state, rc, f" — {error}" if error else "",
+                job["id"], state, rc,
+                f" — {error}" if error else (f" — {stop_reason}" if stop_reason else ""),
             )
             if pruned:
                 logger.info("retention: из истории очереди удалено %d старых заданий", pruned)

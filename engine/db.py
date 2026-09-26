@@ -152,6 +152,14 @@ DDL: tuple[str, ...] = (
     # прежнее поведение всех кнопок. TIMESTAMPTZ хранит абсолютный момент:
     # часовой пояс — дело вызывающего (TZ контейнера web), БД сравнивает мгновения.
     "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ",
+    # Миграция 1.10.0 (полировка очереди): причина остановки задания. error —
+    # про ОШИБКИ (failed), stop_reason — про то, ПОЧЕМУ задание не доработало
+    # (отменено/Стоп/сигнал/обрыв); в истории показывается stop_reason или error.
+    "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS stop_reason TEXT",
+    # Миграция 1.10.0: глобальная пауза очереди (флаг в БД — переживает
+    # рестарты, как и всё в этой схеме). true — claim_next молчит, задания
+    # (в т.ч. отложенные) ждут в очереди; выполняемое задание дорабатывает.
+    "ALTER TABLE status ADD COLUMN IF NOT EXISTS runner_paused BOOLEAN NOT NULL DEFAULT false",
 )
 
 
@@ -236,6 +244,21 @@ def request_stop(conn: psycopg.Connection) -> bool:
 
 def get_stop_requested(conn: psycopg.Connection) -> bool:
     return bool(scalar(conn, "SELECT stop_requested FROM status WHERE id = 1"))
+
+
+def set_runner_paused(conn: psycopg.Connection, paused: bool) -> None:
+    """Глобальная пауза очереди (1.10.0): claim_next молчит, пока флаг поднят.
+
+    Как и request_stop — просто UPDATE строки статуса: тонкий клиент UI не
+    запускает и не останавливает процессы, только пишет флаг в БД.
+    """
+    with conn.cursor() as cur:
+        cur.execute("UPDATE status SET runner_paused = %s, updated_at = now() WHERE id = 1",
+                    (bool(paused),))
+
+
+def get_runner_paused(conn: psycopg.Connection) -> bool:
+    return bool(scalar(conn, "SELECT runner_paused FROM status WHERE id = 1"))
 
 
 def get_status_row(conn: psycopg.Connection) -> dict[str, Any] | None:

@@ -107,6 +107,112 @@ def _local_tz():
         return datetime.now().astimezone().tzinfo
 
 
+# ----------------------------- тема оформления (1.11.0) -----------------------------
+
+THEME_QP = "theme"  # ключ st.query_params: ?theme=dark|light — выбор переживает F5
+
+# Тёмная тема — инжектируемый CSS поверх дефолтной светлой (streamlit==1.45.0
+# не умеет менять тему в рантайме). Светлая тема = инжекции НЕТ: вид приложения
+# ровно тот же, что до 1.11.0 (ноль регрессии). Селекторы — стабильные
+# data-testid/data-baseweb-атрибуты DOM Streamlit 1.45.
+THEME_DARK_CSS = """
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stAppViewBlockContainer"] {
+    background-color: #0e1117;
+}
+body, .stApp { color-scheme: dark; }
+.stApp { color: #e8eaf0; }
+[data-testid="stHeader"] { background-color: #0e1117 !important; }
+[data-testid="stHeader"] svg { fill: #e8eaf0; }
+[data-testid="collapsedControl"] { background-color: #161a22 !important; color: #e8eaf0;
+    border-color: rgba(255,255,255,.2) !important; }
+[data-testid="stSidebar"] { background-color: #161a22; border-right: 1px solid rgba(255,255,255,.08); }
+.stApp a, [data-testid="stSidebar"] a { color: #7cc0ff; }
+.stApp a:hover { color: #a3d4ff; }
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p { color: #9aa2b1 !important; }
+[data-testid="stWidgetLabel"] p { color: #e8eaf0 !important; }
+.stApp hr { border-color: rgba(255,255,255,.14) !important; }
+[data-testid="stExpander"] details { border-color: rgba(255,255,255,.14) !important;
+    background-color: transparent !important; }
+[data-testid="stExpander"] summary:hover { background-color: rgba(255,255,255,.05) !important; }
+[data-testid="stExpander"] summary svg { fill: #9aa2b1 !important; }
+[data-testid="stForm"] { border-color: rgba(255,255,255,.14) !important; }
+[data-testid="stMetric"] { background-color: #161a22 !important;
+    border: 1px solid rgba(255,255,255,.10) !important; border-radius: 10px;
+    padding: 14px 16px 10px !important; }
+[data-testid="stMetricLabel"], [data-testid="stMetricLabel"] p { color: #9aa2b1 !important; }
+[data-testid="stMetricValue"] { color: #e8eaf0 !important; }
+.stProgress { background-color: #242b36 !important; border-radius: 6px; }
+.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button {
+    background-color: #1b202a !important; color: #e8eaf0 !important;
+    border: 1px solid rgba(255,255,255,.22) !important; }
+.stButton > button:hover, .stDownloadButton > button:hover,
+[data-testid="stFormSubmitButton"] > button:hover {
+    background-color: #212734 !important; border-color: #ff4b4b !important; color: #ff8a8a !important; }
+.stApp button[kind="primary"], [data-testid="stFormSubmitButton"] button[kind="primary"] {
+    background-color: #ff4b4b !important; color: #fff !important; border-color: #ff4b4b !important; }
+.stApp button[kind="primary"]:hover { background-color: #ff6b6b !important; color: #fff !important; }
+/* кнопки 1.45: обёртка .stButton не является родителем button — селектор по kind */
+.stApp button[kind="secondary"] {
+    background-color: #1b202a !important; color: #e8eaf0 !important;
+    border: 1px solid rgba(255,255,255,.22) !important; }
+.stApp button[kind="secondary"]:hover {
+    background-color: #212734 !important; border-color: #ff4b4b !important; color: #ff8a8a !important; }
+/* заголовки/жирные метки/expander-сводки: в светлой теме у них явный тёмный цвет */
+.stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6 { color: #e8eaf0 !important; }
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] strong,
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: #e8eaf0 !important; }
+[data-testid="stExpander"] summary, [data-testid="stExpander"] summary p { color: #e8eaf0 !important; }
+[data-testid="stTabs"] [data-baseweb="tab-list"] { border-bottom-color: rgba(255,255,255,.14); }
+[data-testid="stTabs"] button[data-baseweb="tab"] { color: #9aa2b1 !important; }
+[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"] { color: #e8eaf0 !important; }
+[data-baseweb="input"] { background-color: #161a22; border-color: rgba(255,255,255,.25); }
+[data-baseweb="input"] input, [data-baseweb="input"] textarea, [data-baseweb="input"] [contenteditable] {
+    color: #e8eaf0 !important; caret-color: #e8eaf0; background-color: transparent !important; }
+[data-baseweb="select"] > div { background-color: #161a22 !important;
+    border-color: rgba(255,255,255,.25) !important; color: #e8eaf0; }
+[data-baseweb="select"] svg { fill: #9aa2b1; }
+[data-baseweb="checkbox"], [data-baseweb="radio"], [data-baseweb="toggle"] { color: #e8eaf0; }
+[data-baseweb="popover"] > div { background-color: #1e242f !important; color: #e8eaf0;
+    border: 1px solid rgba(255,255,255,.14); }
+[data-baseweb="popover"] li { color: #e8eaf0 !important; }
+[data-baseweb="popover"] li:hover { background-color: #2a3140; }
+[data-baseweb="calendar"] { background-color: #1e242f !important; color: #e8eaf0 !important; }
+[data-baseweb="calendar"] button { color: #e8eaf0 !important; }
+[data-testid="stCodeBlock"], .stApp pre {
+    background-color: #11151c !important; border: 1px solid rgba(255,255,255,.10); border-radius: 8px; }
+.stApp pre, .stApp pre span, .stApp code { color: #c9d1dc !important; }
+.stApp :not(pre) > code { background-color: #252b36 !important; color: #e8eaf0 !important;
+    padding: .1em .35em; border-radius: 4px; }
+.stApp blockquote { color: #b9c0cc; border-left-color: rgba(255,255,255,.25); }
+.stApp th, .stApp td { border-color: rgba(255,255,255,.15) !important; }
+.stApp th { background-color: #1a2029; }
+[data-testid="stToast"] { background-color: #1e242f !important; color: #e8eaf0 !important;
+    border: 1px solid rgba(255,255,255,.14); }
+[data-testid="stDialog"], [data-testid="stDialog"] [role="dialog"] {
+    background-color: #161a22 !important; color: #e8eaf0; }
+[data-testid="stDialog"] p, [data-testid="stDialog"] [data-testid="stMarkdownContainer"] {
+    color: #e8eaf0; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #2a3140; border-radius: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+"""
+
+
+def _resolve_theme() -> bool:
+    """Тема (1.11.0): seed session_state из ?theme= — ДО создания виджета
+    (переключатель в сайдбаре живёт с key="theme_dark" и подхватывает значение).
+    Без параметра и без состояния — светлая (дефолт, как до 1.11.0)."""
+    if "theme_dark" not in st.session_state:
+        st.session_state["theme_dark"] = st.query_params.get(THEME_QP) == "dark"
+    return bool(st.session_state["theme_dark"])
+
+
+def _inject_theme(dark: bool) -> None:
+    """CSS темы — в самом начале рана (до любых дельт), чтобы не «мигало»."""
+    if dark:
+        st.markdown(f"<style>{THEME_DARK_CSS}</style>", unsafe_allow_html=True)
+
+
 # ----------------------------- вспомогательные -----------------------------
 
 def human_size(n: float | int | None) -> str:
@@ -133,7 +239,7 @@ def engine_row() -> dict | None:
     rows = q(
         """
         SELECT stage, processed, total, current_file, files_per_sec, started_at, updated_at,
-               engine_pid, stop_requested, params,
+               engine_pid, stop_requested, runner_paused, params,
                (updated_at > now() - make_interval(secs => %s)) AS alive
         FROM status WHERE id = 1
         """,
@@ -233,6 +339,16 @@ def _banner(row: dict | None) -> None:
 
 def _sidebar(settings: Settings, row: dict | None) -> None:
     with st.sidebar:
+        # Тема (1.11.0): переключатель в самом верху сайдбара. Значение живёт в
+        # session_state (key="theme_dark", seed из ?theme= в _resolve_theme);
+        # выбор отражаем в адресе страницы — переживает F5 и шарится ссылкой.
+        dark = st.toggle(
+            "🌙 Тёмная тема", key="theme_dark",
+            help="Мгновенно переключает оформление. Выбор запоминается в адресе "
+                 "страницы (?theme=dark|light) и переживает обновление страницы; "
+                 "светлая тема — прежний вид приложения.",
+        )
+        st.query_params[THEME_QP] = "dark" if dark else "light"
         st.header("🖼 Photo Dedup")
         p = settings.paths
         hr = host_root()
@@ -464,6 +580,7 @@ def monitor_fragment(settings: Settings) -> None:
         return
     working = is_working(row)
     locked = working
+    paused = bool(row.get("runner_paused"))  # 1.10.0: глобальная пауза очереди
 
     # --- очередь заданий runner + автообновление галереи (edge-детект) ---
     # ⚠️ Блок намеренно ПЕРВЫМ в фрагменте (1.7.1): если на границе
@@ -491,7 +608,10 @@ def monitor_fragment(settings: Settings) -> None:
     due_queued = any(j["scheduled_at"] is None or j["scheduled_at"] <= now_local
                      for j in queued_jobs)
     has_live_job = bool(queued or running_job)
-    job_disabled = locked or bool(running_job) or due_queued
+    # 1.10.0: на глобальной паузе срочные queued-задания runner не берёт —
+    # не блокируем кнопки запуска: новые задания лягут в очередь и будут ждать
+    # снятия паузы вместе с остальными (uniq-индекс по-прежнему отсекает дубли).
+    job_disabled = locked or bool(running_job) or (due_queued and not paused)
 
     # Автообновление галереи после прогона (1.7.0): этот фрагмент и так опрашивает
     # БД каждые MONITOR_REFRESH_SEC независимо от активной вкладки (st.tabs не
@@ -569,6 +689,25 @@ def monitor_fragment(settings: Settings) -> None:
     if working and row["stop_requested"]:
         cb.caption("Ожидание остановки движка…")
 
+    # --- глобальная пауза очереди (1.10.0): флаг в БД, runner молчит в claim_next ---
+    # Как и «Стоп» — тонкий клиент пишет только флаг; выполняемое задание
+    # доработает штатно, отложенные тоже ждут (срок не важен).
+    pq1, pq2 = st.columns([1, 3])
+    if pq1.button(
+            "▶️ Возобновить очередь" if paused else "⏸ Пауза очереди",
+            help=("Глобальная пауза: runner не берёт задания из очереди (в т.ч. отложенные, "
+                  "у которых срок уже наступил). Уже выполняемое задание доработает штатно. "
+                  "Флаг хранится в БД — переживает рестарты контейнеров; «💥 Очистить БД» сбрасывает."),
+            use_container_width=True,
+    ):
+        q("UPDATE status SET runner_paused = %s, updated_at = now() WHERE id = 1",
+          (not paused,), fetch=False)
+        st.toast("⏸ Очередь на паузе — runner не берёт новые задания" if not paused
+                 else "▶️ Пауза снята — runner разберёт очередь", icon="⏸" if not paused else "▶️")
+        st.rerun(scope="fragment")
+    if paused:
+        pq2.caption("⏸ Пауза: runner не берёт задания (в т.ч. отложенные); выполняемое доработает.")
+
     def _qjob(command: str, *, scheduled_at: datetime | None = None) -> None:
         """INSERT задания в очередь + toast (дубликат отсекает uniq-индекс БД)."""
         try:
@@ -578,6 +717,8 @@ def monitor_fragment(settings: Settings) -> None:
                 st.toast(f"Задание #{jid} ({command}) отложено: старт "
                          f"{_fmt_moment(scheduled_at)} — "
                          f"runner запустит его в срок", icon="⏰")
+            elif paused:  # 1.10.0: задание дождётся снятия паузы
+                st.toast(f"Задание #{jid} ({command}) в очереди — пауза: runner возьмёт после снятия", icon="⏸")
             else:
                 st.toast(f"Задание #{jid} ({command}) в очереди — runner возьмёт его через пару секунд", icon="▶️")
         except pg_errors.UniqueViolation:
@@ -679,8 +820,12 @@ def monitor_fragment(settings: Settings) -> None:
         st.caption("Задание выполняет сервис **runner**; прогресс — метрики выше, история — ниже. "
                    "Одновременно в работе — одно задание (single-flight).")
     elif queued:
-        st.caption("В очереди есть задание(я) — их выполнит runner (список ниже: перенос/отмена). "
-                   "Одновременно в работе — одно задание (single-flight).")
+        if paused:  # 1.10.0
+            st.caption("⏸ Пауза: в очереди есть задание(я), но runner возьмёт их только после снятия паузы "
+                       "(список ниже: перенос/отмена работают и на паузе).")
+        else:
+            st.caption("В очереди есть задание(я) — их выполнит runner (список ниже: перенос/отмена). "
+                       "Одновременно в работе — одно задание (single-flight).")
     else:
         st.caption("Кнопки ставят задание в очередь jobs — его выполнит сервис runner "
                    "(тот же образ и код, что у CLI). Настройки — из settings.toml (сайдбар).")
@@ -731,18 +876,58 @@ def monitor_fragment(settings: Settings) -> None:
                 "Resume: просто запустите нужный этап заново — scan/move продолжат с места остановки."
             )
         icons = {"done": "✅", "failed": "❌", "stopped": "🛑", "stale": "⚠️"}
-        lines = []
+        # 1.10.0: история стала интерактивной — удаление записи (✖) и очистка
+        # всей истории (🧹, с подтверждением). Причина остановки — jobs.stop_reason
+        # (или error для записей до 1.10.0).
+        any_finished = bool(snap["recent"])
+        if not any_finished:
+            st.session_state.pop("arm_hclear", None)
+        hh1, hh2 = st.columns([5, 1])
+        hh1.caption("Последние задания runner:")
+        if hh2.button("🧹 Очистить", key="hclear", disabled=not any_finished,
+                      help="Удалить из истории ВСЕ завершённые задания (queued/running не трогаются)",
+                      use_container_width=True):
+            st.session_state["arm_hclear"] = True
+        if st.session_state.get("arm_hclear"):
+            st.warning("🧹 Удалить всю историю очереди (завершённые задания)? "
+                       "Очередь, пауза и файлы не затрагиваются.")
+            hc1, hc2 = st.columns(2)
+            if hc1.button("✅ Да, очистить историю", key="hclear_yes", type="primary"):
+                st.session_state.pop("arm_hclear", None)
+                try:
+                    with get_pool().connection() as conn:
+                        n_del = jobq.clear_finished(conn)
+                except Exception as e:  # БД/пул — показываем, не роняем фрагмент
+                    st.toast(f"Не удалось: {type(e).__name__}: {e}", icon="❌")
+                else:
+                    st.toast(f"История очищена: удалено записей — {n_del}", icon="🧹")
+                st.rerun(scope="fragment")
+            if hc2.button("❌ Отмена", key="hclear_no"):
+                st.session_state.pop("arm_hclear", None)
+                st.rerun(scope="fragment")
         for r in snap["recent"]:
             dur = "—"
             if r["taken_at"] and r["finished_at"]:
                 dur = fmt_eta((r["finished_at"] - r["taken_at"]).total_seconds())
+            reason = r["stop_reason"] or r["error"]
             line = (f"{icons.get(r['state'], '·')} #{r['id']} {r['command']} → {r['state']} · "
                     f"exit {r['exit_code']} · {dur}")
-            if r["error"]:
-                line += f" · {str(r['error'])[:90]}"
-            lines.append(line)
-        if lines:
-            st.caption("Последние задания runner:\n\n" + "\n\n".join(lines))
+            if reason:
+                line += f" · {str(reason)[:90]}"
+            hcol1, hcol2 = st.columns([7, 1])
+            hcol1.caption(line)
+            if hcol2.button("✖", key=f"hdel_{r['id']}",
+                            help="Удалить запись из истории (задание уже завершено; "
+                                 "очередь и файлы не затрагиваются)",
+                            use_container_width=True):
+                try:
+                    with get_pool().connection() as conn:
+                        ok = jobq.delete_finished(conn, r["id"])
+                except Exception as e:  # БД/пул — показываем, не роняем фрагмент
+                    st.toast(f"Не удалось: {type(e).__name__}: {e}", icon="❌")
+                else:
+                    st.toast("Запись удалена из истории" if ok else "Запись уже не в истории", icon="🗑")
+                st.rerun(scope="fragment")
 
     _what_next(row, settings, lr)
 
@@ -1184,6 +1369,10 @@ def _logic_tab() -> None:
 def main() -> None:
     t0 = time.perf_counter()  # замер рерана UI — начало скрипта
 
+    # Тема (1.11.0): resolve + CSS до любых виджетов и дельт (в т.ч. до
+    # экрана «БД недоступна» — он тоже тематизируется).
+
+    _inject_theme(_resolve_theme())
     try:
         row = engine_row()  # первый запрос: заодно проверка доступности БД
     except Exception as e:
