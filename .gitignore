@@ -8,6 +8,3 @@ src/
 trash/
 settings.toml
 *.zip
-
-.tmp/
-.my_readme.md
