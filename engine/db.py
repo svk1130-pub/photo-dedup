@@ -147,6 +147,11 @@ DDL: tuple[str, ...] = (
     # отсекаются на уровне БД, а не только в UI.
     "CREATE UNIQUE INDEX IF NOT EXISTS uniq_jobs_queued_command "
     "ON jobs (command) WHERE state = 'queued'",
+    # Миграция 1.7.0 (Ф3): отложенный запуск. Задание с scheduled_at в будущем
+    # runner не берёт до срока (фильтр в claim_next); NULL = «как можно скорее» —
+    # прежнее поведение всех кнопок. TIMESTAMPTZ хранит абсолютный момент:
+    # часовой пояс — дело вызывающего (TZ контейнера web), БД сравнивает мгновения.
+    "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ",
 )
 
 

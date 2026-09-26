@@ -576,7 +576,7 @@ for rel in ("engine/db.py", "engine/jobs.py", "engine/runner.py", "web/app.py"):
 compose_src = (PROJ / "docker-compose.yml").read_text(encoding="utf-8")
 assert 'entrypoint: ["python", "-m", "engine.runner"]' in compose_src, \
     "Ф1: в compose должен быть сервис runner (entrypoint engine.runner)"
-assert compose_src.count("photo-dedup:1.6.1") == 3, "теги образа engine/web/runner = 1.6.1"
+assert compose_src.count("photo-dedup:1.9.0") == 3, "теги образа engine/web/runner = 1.9.0"
 assert "docker.sock" not in compose_src, "вариант A: docker-сокет нигде не используется"
 db_src15 = (PROJ / "engine" / "db.py").read_text(encoding="utf-8")
 assert "CREATE TABLE IF NOT EXISTS jobs" in db_src15, "Ф1: DDL очереди jobs"
@@ -590,7 +590,7 @@ assert "LISTEN" in runner_src and "reap_stale" in runner_src \
     and "_install_signal_handlers" in runner_src, "LISTEN/NOTIFY + crash-recovery + сигналы"
 assert "▶️ Полный прогон" in app_src and "jobq.enqueue" in app_src, \
     "Ф1/Ф2: кнопки запуска через очередь в Мониторе"
-assert "1.6.1" in (PROJ / "engine" / "__init__.py").read_text(encoding="utf-8")
+assert "1.9.0" in (PROJ / "engine" / "__init__.py").read_text(encoding="utf-8")
 print("10. Ф1 job-runner: пины структуры (compose/DDL/jobs/runner/UI) OK")
 
 # ---------- 11. Ф2 (1.6.0): все длинные команды в очереди + stale-детекция + retention ----------
@@ -623,5 +623,114 @@ assert "first_value(cur.fetchone())" in webops_src, "1.6.1: webops.clean_db бе
 assert "pg_errors.UndefinedTable" in app_src, \
     "1.6.1: _qjob объясняет отсутствие таблицы jobs (runner не стартовал)"
 print("12. хотфикс 1.6.1: first_value (dict_row-пул) + UndefinedTable-подсказка OK")
+
+# ---------- 13. Ф3 (1.7.0): отложенный запуск (scheduled_at) + автообновление галереи ----------
+# Живое поведение очереди с scheduled_at — integ §18j (реальный PostgreSQL);
+# здесь фиксируем структуру: миграция DDL, фильтр срока в claim_next,
+# операции reschedule/cancel_queued, UI-селект и edge-детекция для галереи.
+assert "ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ" in db_src, \
+    "Ф3: миграция jobs.scheduled_at (идемпотентная)"
+assert "scheduled_at: datetime | None = None" in jobs_src, "Ф3: параметр enqueue"
+assert "AND (scheduled_at IS NULL OR scheduled_at <= now())" in jobs_src, \
+    "Ф3: claim_next не берёт задание из будущего"
+assert "def reschedule" in jobs_src and "def cancel_queued" in jobs_src, \
+    "Ф3: перенос/отмена queued-задания в jobs.py"
+assert "queued_jobs" in jobs_src, "Ф3: snapshot отдаёт queued с scheduled_at"
+assert "_WHEN_OPTIONS" in app_src and "Когда запускать" in app_src, \
+    "Ф3: селект «Когда запускать» над кнопками Монитора"
+assert "jobq.reschedule" in app_src and "jobq.cancel_queued" in app_src, \
+    "Ф3: действия ▶️ Сейчас / ⏰ +1 ч / ✖ Отменить над queued-заданием"
+assert "prev_engine_live" in app_src and 'st.rerun(scope="app")' in app_src, \
+    "автообновление галереи: edge «занят → свободен» → один полный rerun"
+assert "ZoneInfo" in app_src and "Europe/Moscow" in app_src, \
+    "Ф3: пояс пресетов из env TZ (по умолчанию Europe/Moscow)"
+assert "TZ" in compose_src, "Ф3: TZ пробрасывается в web/runner из .env"
+runner_src = (PROJ / "engine" / "runner.py").read_text(encoding="utf-8")
+assert "claim_next" in runner_src, "Ф3: runner не менялся — берёт только доступные задания"
+# Ф3-хвост (1.8.0): «Своё время…» = календарная дата + время, а не только ЧЧ:ММ
+# на сегодня/завтра; прошедший момент валидируется в UI (предупреждение +
+# блокировка кнопок), а не молчаливым переносом на завтра.
+assert "def _scheduled_dt(when: str, custom_date: date | None = None," in app_src, \
+    "1.8.0: «Своё время…» принимает точные дату и время"
+assert "datetime.combine(custom_date, custom_time, tzinfo=_local_tz())" in app_src, \
+    "1.8.0: custom-момент строится aware в поясе TZ (интерпретация — как у пресетов)"
+assert "min_value=now_local.date()" in app_src, \
+    "1.8.0: календарь ограничен сегодняшним днём (min_value у date_input)"
+assert "launch_disabled = job_disabled or sched_past" in app_src, \
+    "1.8.0: прошедший custom-момент блокирует запуск (без молчаливого сдвига)"
+assert app_src.count("disabled=launch_disabled") == 5, \
+    "1.8.0: все 5 кнопок запуска учитывают валидацию срока"
+assert "_fmt_moment" in app_src, \
+    "1.8.0: год в отображении отложенного момента, если он не в текущем году"
+assert "from datetime import date, datetime, time as dt_time, timedelta" in app_src, \
+    "1.8.0: импорт date в web/app.py"
+print("13. Ф3: scheduled_at (DDL/claim/reschedule/cancel) + селект UI + автообновление галереи + выбор даты (1.8.0) OK")
+
+# ---------- 14. Хотфикс 1.7.1: скрытие manual-блока в auto + edge-детект до дельт ----------
+# Баги: (1) блок «Опасная зона: подтверждение переноса (manual)» отображался и в
+# auto-режиме (в auto move берёт ВСЕ группы, confirmed не учитывается — блок
+# бессмысленный); (2) после Прогона/Скан задваивались «Опасные зоны»: полный
+# st.rerun(scope="app") выполнялся в СЕРЕДИНЕ фрагмент-рана, и клиентский рендер
+# Streamlit оставлял дублированный хвост фрагмента. Фикс: edge-детект первым
+# делом в фрагменте — до генерации каких-либо дельт.
+assert 'if settings.move.mode == "manual":\n        az1, az2 = st.columns(2)' in app_src, \
+    "1.7.1: блок подтверждения переноса рендерится ТОЛЬКО в manual-режиме"
+assert "def _db_ops_block(" in app_src and "_db_ops_block(settings, locked)" in app_src, \
+    "1.7.1: БД-блок опасной зоны выделен в общий помощник (оба режима)"
+assert app_src.index("prev_engine_live") < app_src.index('c1.metric("Этап"'), \
+    "1.7.1: edge-детект «занят → свободен» выполняется ДО отрисовки элементов фрагмента"
+assert app_src.count('st.rerun(scope="app")') == 1, \
+    "1.7.1: полный rerun приложения — ровно один вызов (в начале monitor_fragment)"
+print("14. хотфикс 1.7.1: manual-блок по режиму + edge-детект до дельт (без задвоения) OK")
+
+# ---------- 15. 1.9.0: CLI schedule (--at/--delay) — клиент очереди jobs ----------
+# Живой путь (INSERT + отложенный claim) — integ §18k; здесь фиксируем структуру
+# (подкоманда, взаимное исключение --at/--delay, uniq-дубликат, TZ) и парсеры.
+cli_src = (PROJ / "engine" / "cli.py").read_text(encoding="utf-8")
+assert '"schedule", parents=[common]' in cli_src, "1.9.0: подкоманда schedule"
+assert "choices=jobs.COMMANDS" in cli_src, "1.9.0: в очередь ставятся только очередь-команды"
+assert "psycopg.errors.UniqueViolation" in cli_src, \
+    "1.9.0: дубликат queued-команды отсекается uniq-индексом с понятным сообщением (rc 1)"
+assert "уже в прошлом" in cli_src, \
+    "1.9.0: прошедший --at — ошибка без молчаливого сдвига (семантика «Своё время…» UI)"
+assert "ZoneInfo" in cli_src and '"Europe/Moscow"' in cli_src, \
+    "1.9.0: пояс --at из env TZ (по умолчанию Europe/Moscow — как у пресетов UI)"
+assert 'args.command not in ("undo", "schedule")' in cli_src, \
+    "1.9.0: schedule не создаёт trash — это только INSERT в очередь"
+assert "TZ: ${TZ:-Europe/Moscow}" in compose_src.split("  engine:")[1].split("  runner:")[0], \
+    "1.9.0: engine-сервис получает TZ (иначе --at посчитается в UTC контейнера)"
+from datetime import datetime as _dt19, timedelta as _td19, timezone as _tz19  # noqa: E402
+from types import SimpleNamespace as _NS19  # noqa: E402
+from engine.cli import _parse_at, _parse_delay, _schedule_moment  # noqa: E402
+now19 = _dt19(2026, 9, 26, 12, 0, tzinfo=_tz19.utc)
+assert _parse_delay("90", now19) == now19 + _td19(minutes=90), "без суффикса — минуты"
+assert _parse_delay("2h", now19) == now19 + _td19(hours=2)
+assert _parse_delay("1d12h", now19) == now19 + _td19(hours=36), "сегменты суммируются"
+for _bad in ("", "abc", "1x", "-5m", "h", "0"):
+    try:
+        _parse_delay(_bad, now19)
+        raise AssertionError(f"ожидали ValueError на --delay {_bad!r}")
+    except ValueError:
+        pass
+iso19 = _parse_at("2027-03-15 09:30", now19)
+assert iso19 == _parse_at("15.03.2027 09:30", now19), "ISO и ДД.ММ.ГГГГ — одно и то же"
+assert iso19 == _parse_at("2027-03-15T09:30", now19), "ISO с T тоже принимается"
+assert iso19.utcoffset() == now19.utcoffset(), "момент наследует пояс now (TZ)"
+assert _parse_at("15:30", now19) == now19.replace(hour=15, minute=30), \
+    "ЧЧ:ММ = СЕГОДНЯ (strptime даёт 1900-01-01 — день обязан браться из now)"
+assert _parse_at("2030-01-02", now19) == _dt19(2030, 1, 2, 0, 0, tzinfo=_tz19.utc), "дата = 00:00"
+for _bad in ("2000-01-01 00:00", "11:00"):  # 11:00 уже прошло для now19=12:00
+    try:
+        _parse_at(_bad, now19)
+        raise AssertionError(f"ожидали ValueError на прошедший --at {_bad!r}")
+    except ValueError:
+        pass
+for _args in (_NS19(at="x", delay="y"), _NS19(at=None, delay=None)):
+    try:
+        _schedule_moment(_args)
+        raise AssertionError("ожидали ValueError: ровно один из --at/--delay")
+    except ValueError:
+        pass
+print("15. 1.9.0 CLI schedule: подкоманда + парсеры --at/--delay + TZ + uniq-дубликат OK")
 
 print("\nALL SMOKE TESTS PASSED")

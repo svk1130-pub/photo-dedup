@@ -810,6 +810,77 @@ assert webops_db.scalar(dconn, "SELECT count(*) FROM jobs") == 0
 dconn.close()
 print("18i. dict_row-пул (как web): enqueue/scalar/clean_db OK")
 
+# 18j. Ф3 (1.7.0): отложенный запуск — scheduled_at
+# Очередь пуста после clean_db в 18h/18i. Гварды: status.stage='idle' (18c).
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: E402
+
+future18 = _dt.now(_tz.utc) + _td(hours=1)
+sjid18 = jobq.enqueue(jconn, "analyze", scheduled_at=future18)
+assert jobq.claim_next(jconn, "runner-test") is None, "задание из будущего брать нельзя"
+snap18j = jobq.snapshot(jconn)
+assert snap18j["queued"] == 1 and len(snap18j["queued_jobs"]) == 1, snap18j
+assert snap18j["queued_jobs"][0]["scheduled_at"] is not None
+assert snap18j["queued_jobs"][0]["command"] == "analyze"
+# перенос на «сейчас» (reschedule → None) — берётся немедленно
+assert jobq.reschedule(jconn, sjid18, None) is True
+job18j = jobq.claim_next(jconn, "runner-test")
+assert job18j and job18j["id"] == sjid18, job18j
+jobq.finish(jconn, sjid18, state="done", exit_code=0)
+# отмена не начатого: queued → stopped «не начато», слот uniq-индекса освобождается
+cjid18 = jobq.enqueue(jconn, "scan", scheduled_at=_dt.now(_tz.utc) + _td(minutes=30))
+assert jobq.cancel_queued(jconn, cjid18) is True
+assert jconn.execute("SELECT state, exit_code, error FROM jobs WHERE id=%s", (cjid18,)).fetchone() \
+    == ("stopped", None, "отменено пользователем (не начато)")
+jobq.enqueue(jconn, "scan")                  # uniq-индекс: слот scan свободен — не падает
+assert jobq.cancel_queued(jconn, cjid18) is False, "повторная отмена невозможна (не queued)"
+jconn.execute("DELETE FROM jobs WHERE state = 'queued'")  # убираем scan — не мешает следующим шагам
+# отложенное «в прошлое» (планирование на прошедшее время) — берётся сразу
+past18 = _dt.now(_tz.utc) - _td(seconds=5)
+pjid18 = jobq.enqueue(jconn, "move", scheduled_at=past18)
+pjob18 = jobq.claim_next(jconn, "runner-test")
+assert pjob18 and pjob18["id"] == pjid18, pjob18
+jobq.finish(jconn, pjid18, state="done", exit_code=0)
+# running reschedule/cancel не трогают (False) — остановка это кнопка Стоп
+assert jobq.reschedule(jconn, pjid18, _dt.now(_tz.utc) + _td(hours=1)) is False
+assert jobq.cancel_queued(jconn, pjid18) is False
+jconn.execute("DELETE FROM jobs")            # чистим историю — §18 завершён
+print("18j. Ф3 scheduled_at: будущее не берётся, reschedule/cancel_queued, слот освобождается OK")
+
+# 18k. 1.9.0: CLI schedule (--at/--delay) — постановка отложенного задания из CLI.
+# Парсеры --at/--delay покрыты smoke §15; здесь живой путь: cli_main → INSERT в
+# jobs (с params-overrides) → строка queued с корректным scheduled_at.
+assert jconn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0, "очередь пуста после 18j"
+
+rc18k = cli_main(["--settings", str(settings_path), "schedule", "run",
+                  "--delay", "90m", "--threads", "3"])
+assert rc18k == 0, f"schedule --delay rc={rc18k}"
+row18k = jconn.execute(
+    "SELECT command, state, params->>'threads', "
+    "scheduled_at BETWEEN now() + interval '89 minutes' AND now() + interval '91 minutes' "
+    "FROM jobs WHERE state='queued'"
+).fetchone()
+assert row18k == ("run", "queued", "3", True), row18k  # params дойдут до runner'а, срок ≈ +90м
+print("18k-1. schedule --delay: queued run c params и scheduled_at ≈ +90 мин OK")
+
+# дубликат queued-команды (uniq-индекс) → rc 1 с понятным сообщением (не traceback)
+rc18k = cli_main(["--settings", str(settings_path), "schedule", "run", "--at", "2099-01-01 09:00"])
+assert rc18k == 1, f"дубликат должен давать rc=1, got {rc18k}"
+# прошедший момент → rc 2: явная дата не сдвигается молча
+rc18k = cli_main(["--settings", str(settings_path), "schedule", "scan", "--at", "2000-01-01 00:00"])
+assert rc18k == 2, rc18k
+# оба флага сразу / нечитаемый формат → rc 2
+rc18k = cli_main(["--settings", str(settings_path), "schedule", "scan",
+                  "--at", "2099-01-01 09:00", "--delay", "5m"])
+assert rc18k == 2, rc18k
+rc18k = cli_main(["--settings", str(settings_path), "schedule", "scan", "--at", "когда-нибудь"])
+assert rc18k == 2, rc18k
+# вторая команда ставится свободно (uniq — на команду, не на очередь целиком)
+rc18k = cli_main(["--settings", str(settings_path), "schedule", "scan", "--delay", "45m"])
+assert rc18k == 0, rc18k
+assert jconn.execute("SELECT count(*) FROM jobs WHERE state='queued'").fetchone()[0] == 2
+jconn.execute("DELETE FROM jobs WHERE state='queued'")  # будущее не мешает следующим шагам
+print("18k-2. schedule: дубликат rc=1, прошедший/оба флага/битый --at rc=2 OK")
+
 jconn.close()
 print("18. очередь jobs + runner (Ф1/Ф2) OK")
 

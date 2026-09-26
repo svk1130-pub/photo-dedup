@@ -24,8 +24,10 @@ import os
 import sys
 import time
 import tomllib
+from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -90,6 +92,19 @@ def _read_refresh_at_import() -> int:
 
 
 MONITOR_REFRESH_SEC = max(1, _read_refresh_at_import())
+
+
+def _local_tz():
+    """Часовой пояс UI (Ф3): env TZ контейнера web, по умолчанию Europe/Moscow.
+
+    Используется для пресетов «сегодня/завтра в 03:00» и отображения времени
+    отложенных заданий. В БД уходит aware datetime — TIMESTAMPTZ хранит
+    абсолютный момент, так что пояс влияет только на ИНТЕРПРЕТАЦИЮ пресетов.
+    """
+    try:
+        return ZoneInfo(os.environ.get("TZ", "Europe/Moscow"))
+    except Exception:  # нет tzdata в системе — откат к поясу процесса
+        return datetime.now().astimezone().tzinfo
 
 
 # ----------------------------- вспомогательные -----------------------------
@@ -379,6 +394,67 @@ docker compose run --rm engine status          # статус
 docker compose run --rm engine stop            # мягкая остановка"""
 
 
+# --- Ф3 (1.7.0): отложенный запуск — пресеты «Когда запускать» ---
+
+_WHEN_OPTIONS = ("Сейчас", "через 30 мин", "через 1 ч", "через 3 ч",
+                 "сегодня в 03:00", "завтра в 03:00", "Своё время…")
+
+
+def _scheduled_dt(when: str, custom_date: date | None = None,
+                  custom_time: dt_time | None = None) -> datetime | None:
+    """Выбор «Когда запускать» → абсолютный момент (aware) или None = сейчас.
+
+    Пресет «сегодня в 03:00», который уже прошёл, превращается в ближайшее
+    будущее (завтра) — у пресетов сдвиг формата «на ночь», там это ожидаемо.
+    «Своё время…» (1.8.0) — ТОЧНЫЕ дата и время из календаря: возвращается как
+    есть, даже если момент в прошлом (календарь ограничен min_value = сегодня,
+    остаточный случай «сегодня, но время уже прошло» валидируется в UI
+    предупреждением и блокировкой кнопок — молчаливый перенос на завтра
+    противоречил бы явному выбору даты). psycopg передаст aware datetime в
+    TIMESTAMPTZ: БД хранит мгновение, пояс — только интерпретация пресетов.
+    """
+    if when == "Сейчас":
+        return None
+    now = datetime.now(_local_tz())
+    if when == "через 30 мин":
+        return now + timedelta(minutes=30)
+    if when == "через 1 ч":
+        return now + timedelta(hours=1)
+    if when == "через 3 ч":
+        return now + timedelta(hours=3)
+    if when in ("сегодня в 03:00", "завтра в 03:00"):
+        dt = now.replace(hour=3, minute=0, second=0, microsecond=0)
+        if dt <= now or when == "завтра в 03:00":
+            dt += timedelta(days=1)
+        return dt
+    if custom_date is not None and custom_time is not None:  # «Своё время…»
+        return datetime.combine(custom_date, custom_time, tzinfo=_local_tz())
+    return None
+
+
+def _fmt_moment(dt: datetime) -> str:
+    """«DD.MM HH:MM», а для другого года — «DD.MM.YYYY HH:MM» (1.8.0: выбор даты
+    позволяет ставить задание далеко вперёд — без года строка двусмысленна)."""
+    dt_loc = dt.astimezone(_local_tz())
+    if dt_loc.year != datetime.now(_local_tz()).year:
+        return f"{dt_loc:%d.%m.%Y %H:%M}"
+    return f"{dt_loc:%d.%m %H:%M}"
+
+
+def _fmt_left(dt: datetime, now: datetime) -> str:
+    """«через 3 ч 05 мин» — обратный отсчёт отложенного задания."""
+    sec = int((dt - now).total_seconds())
+    if sec <= 0:
+        return "срок наступил"
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"через {h} ч {m:02d} мин"
+    if m:
+        return f"через {m} мин {s:02d} с"
+    return f"через {s} с"
+
+
 @st.fragment(run_every=f"{MONITOR_REFRESH_SEC}s")
 def monitor_fragment(settings: Settings) -> None:
     tf = time.perf_counter()
@@ -388,6 +464,48 @@ def monitor_fragment(settings: Settings) -> None:
         return
     working = is_working(row)
     locked = working
+
+    # --- очередь заданий runner + автообновление галереи (edge-детект) ---
+    # ⚠️ Блок намеренно ПЕРВЫМ в фрагменте (1.7.1): если на границе
+    # «занят → свободен» нужен полный rerun приложения (обновление галереи
+    # после прогона), он происходит ДО генерации каких-либо дельт фрагмента.
+    # Прерывание фрагмент-рана с уже отрисованными элементами (прежний
+    # вариант — rerun в середине фрагмента) заставляло клиентский рендер
+    # Streamlit оставлять дублированный хвост фрагмента — задвоение блоков
+    # «Опасная зона» после завершения Прогона/Скан.
+    try:
+        with get_pool().connection() as conn:
+            # stale-детекция из UI (Ф2): runner мог погибнуть — reap по протухшему
+            # heartbeat'у делаем и здесь (дешёвый UPDATE, обычно 0 строк)
+            jobq.reap_stale(conn, stale_sec=REAP_STALE_SEC)
+            snap = jobq.snapshot(conn)
+    except Exception:            # таблицы jobs ещё нет (до первого старта движка/runner'а)
+        snap = None
+    queued = snap["queued"] if snap else 0
+    running_job = snap["running"] if snap else None
+    queued_jobs = snap["queued_jobs"] if snap else []  # Ф3: детали queued (scheduled_at)
+    now_local = datetime.now(_local_tz())
+    # Ф3: ОДНО отложенное на ночь задание не мешает немедленному запуску ДРУГИХ
+    # команд — блокирует только задание, которое runner возьмёт прямо сейчас
+    # (или уже выполняет). Дубль той же команды отсечёт uniq-индекс (toast).
+    due_queued = any(j["scheduled_at"] is None or j["scheduled_at"] <= now_local
+                     for j in queued_jobs)
+    has_live_job = bool(queued or running_job)
+    job_disabled = locked or bool(running_job) or due_queued
+
+    # Автообновление галереи после прогона (1.7.0): этот фрагмент и так опрашивает
+    # БД каждые MONITOR_REFRESH_SEC независимо от активной вкладки (st.tabs не
+    # размонтирует содержимое). Переход «движок/задание заняты → освободились»
+    # означает завершение прогона — делаем ОДИН полный rerun приложения, и
+    # галерея перечитывает БД (кнопки разблокируются тоже). Постоянный поллинг
+    # галереи НЕ включаем намеренно: перерисовка миниатюр тяжела при больших
+    # архивах; цена решения — те же миллисекундные запросы статуса, что и были.
+    live_now = bool(working or has_live_job)
+    prev_live = st.session_state.get("prev_engine_live")
+    st.session_state["prev_engine_live"] = live_now
+    if prev_live and not live_now:
+        st.rerun(scope="app")  # раз на границе «занят → свободен», без зацикливания
+
     total = int(row["total"] or 0)
     processed = int(row["processed"] or 0)
     pct = min(processed / total, 1.0) if total else 0.0
@@ -451,26 +569,17 @@ def monitor_fragment(settings: Settings) -> None:
     if working and row["stop_requested"]:
         cb.caption("Ожидание остановки движка…")
 
-    # --- очередь заданий runner (Ф2: кнопки всех длинных команд ставят INSERT в jobs) ---
-    try:
-        with get_pool().connection() as conn:
-            # stale-детекция из UI (Ф2): runner мог погибнуть — reap по протухшему
-            # heartbeat'у делаем и здесь (дешёвый UPDATE, обычно 0 строк)
-            jobq.reap_stale(conn, stale_sec=REAP_STALE_SEC)
-            snap = jobq.snapshot(conn)
-    except Exception:            # таблицы jobs ещё нет (до первого старта движка/runner'а)
-        snap = None
-    queued = snap["queued"] if snap else 0
-    running_job = snap["running"] if snap else None
-    has_live_job = bool(queued or running_job)
-    job_disabled = locked or has_live_job
-
-    def _qjob(command: str) -> None:
+    def _qjob(command: str, *, scheduled_at: datetime | None = None) -> None:
         """INSERT задания в очередь + toast (дубликат отсекает uniq-индекс БД)."""
         try:
             with get_pool().connection() as conn:
-                jid = jobq.enqueue(conn, command)
-            st.toast(f"Задание #{jid} ({command}) в очереди — runner возьмёт его через пару секунд", icon="▶️")
+                jid = jobq.enqueue(conn, command, scheduled_at=scheduled_at)
+            if scheduled_at is not None:
+                st.toast(f"Задание #{jid} ({command}) отложено: старт "
+                         f"{_fmt_moment(scheduled_at)} — "
+                         f"runner запустит его в срок", icon="⏰")
+            else:
+                st.toast(f"Задание #{jid} ({command}) в очереди — runner возьмёт его через пару секунд", icon="▶️")
         except pg_errors.UniqueViolation:
             st.toast(f"Задание `{command}` уже стоит в очереди", icon="⏳")
         except pg_errors.UndefinedTable:
@@ -478,55 +587,99 @@ def monitor_fragment(settings: Settings) -> None:
                      "(или любая команда движка) при старте. Проверьте: `docker compose up -d db web runner` "
                      "и `docker compose logs runner`.")
 
+    def _job_action(toast: str, action) -> None:
+        """Операция над queued-заданием (reschedule/cancel_queued) + перерисовка."""
+        try:
+            with get_pool().connection() as conn:
+                ok = action(conn)
+        except Exception as e:  # БД/пул — показываем, не роняем фрагмент
+            st.toast(f"Не удалось: {type(e).__name__}: {e}", icon="❌")
+            return
+        st.toast(toast if ok else "Задание уже не в очереди", icon="⏰" if ok else "⚠️")
+        st.rerun(scope="fragment")
+
+    # --- Ф3: выбор «Когда запускать» применяется к ЛЮБОЙ кнопке ниже ---
+    # 1.8.0 (Ф3-хвост): «Своё время…» = календарная дата + время, а не только
+    # ЧЧ:ММ на сегодня/завтра. Прошедший момент НЕ молча переносится (как у
+    # пресетов), а блокирует кнопки с предупреждением — выбор даты явный.
+    wcol, dcol, tcol = st.columns([2.6, 1.3, 1])
+    when = wcol.selectbox(
+        "Когда запускать", _WHEN_OPTIONS, index=0,
+        help=("«Сейчас» — прежнее поведение (runner возьмёт через пару секунд). "
+              "Отложенные варианты ставят задание с scheduled_at: runner возьмёт "
+              "его не раньше срока (точность ~2 с). Если к сроку движок занят — "
+              "задание выполнится, когда освободится (single-flight). «Своё "
+              "время…» — точные дата и время; прошедший момент заблокирует "
+              "кнопки. Перенести/отменить — в списке очереди ниже."),
+    )
+    custom_date: date | None = None
+    custom_time: dt_time | None = None
+    if when == "Своё время…":
+        custom_date = dcol.date_input(
+            "Дата", value=now_local.date(), min_value=now_local.date(),
+            format="DD.MM.YYYY",
+            help="Календарная дата запуска (сегодня или позже)",
+        )
+        custom_time = tcol.time_input("Время", value=dt_time(3, 0), label_visibility="collapsed")
+    sched = _scheduled_dt(when, custom_date, custom_time)
+    sched_past = sched is not None and sched <= now_local
+    launch_disabled = job_disabled or sched_past
+    if sched_past:
+        st.warning("⏰ Выбранный момент уже в прошлом — выберите будущие дату/время "
+                   "или вариант «Сейчас».")
+
     b_run, b_scan, b_anl, b_move, b_undo = st.columns([1.3, 1, 1, 1, 1])
     if b_run.button(
-            "▶️ Полный прогон", type="primary", disabled=job_disabled,
+            "▶️ Полный прогон", type="primary", disabled=launch_disabled,
             help=("scan → analyze → move одним заданием (auto-режим переносит дубликаты в trash; "
                   "move.dry_run из сайдбара главнее). Выполнит сервис runner с текущим settings.toml. "
                   "Мягкая остановка — кнопка Стоп."),
     ):
-        _qjob("run")
+        _qjob("run", scheduled_at=sched)
         st.rerun(scope="fragment")
     if b_scan.button(
-            "🔍 Скан", disabled=job_disabled,
+            "🔍 Скан", disabled=launch_disabled,
             help="Только этап scan: индексация src (новые/изменённые файлы). Resume штатный.",
     ):
-        _qjob("scan")
+        _qjob("scan", scheduled_at=sched)
         st.rerun(scope="fragment")
     if b_anl.button(
-            "🧠 Анализ", disabled=job_disabled,
+            "🧠 Анализ", disabled=launch_disabled,
             help="Только этап analyze: поиск групп-дубликатов (threshold из сайдбара).",
     ):
-        _qjob("analyze")
+        _qjob("analyze", scheduled_at=sched)
         st.rerun(scope="fragment")
     if b_move.button(
-            "📦 Перенос", disabled=job_disabled,
+            "📦 Перенос", disabled=launch_disabled,
             help=("Только этап move: перенос дубликатов в trash (auto — все группы последнего "
                   "run; manual — только подтверждённые; move.dry_run из сайдбара главнее)."),
     ):
-        _qjob("move")
+        _qjob("move", scheduled_at=sched)
         st.rerun(scope="fragment")
     if b_undo.button(
-            "↩️ Undo", disabled=job_disabled,
+            "↩️ Undo", disabled=launch_disabled,
             help="Вернуть ВСЕ перенесённые в trash файлы и очистить результаты. Выполнит runner (с подтверждением).",
     ):
         st.session_state["arm_qundo"] = True
         st.rerun(scope="fragment")
-    if job_disabled:
+    if job_disabled or sched_past:
         st.session_state.pop("arm_qundo", None)
     if st.session_state.get("arm_qundo"):
         st.warning("↩️ **Undo вернёт все перенесённые файлы** из trash в src и очистит результаты прогонов. Точно?")
         u1, u2 = st.columns(2)
         if u1.button("✅ Да, вернуть файлы", key="qundo_yes", type="primary"):
             st.session_state.pop("arm_qundo", None)
-            _qjob("undo")
+            _qjob("undo", scheduled_at=sched)
             st.rerun(scope="fragment")
         if u2.button("❌ Отмена", key="qundo_no"):
             st.session_state.pop("arm_qundo", None)
             st.rerun(scope="fragment")
 
-    if has_live_job:
+    if running_job:
         st.caption("Задание выполняет сервис **runner**; прогресс — метрики выше, история — ниже. "
+                   "Одновременно в работе — одно задание (single-flight).")
+    elif queued:
+        st.caption("В очереди есть задание(я) — их выполнит runner (список ниже: перенос/отмена). "
                    "Одновременно в работе — одно задание (single-flight).")
     else:
         st.caption("Кнопки ставят задание в очередь jobs — его выполнит сервис runner "
@@ -539,7 +692,37 @@ def monitor_fragment(settings: Settings) -> None:
                     + (f" (взял {taken})" if taken else "")
                     + " — мягкая остановка: кнопка 🛑 Стоп выше.")
         elif queued:
-            st.info(f"⏳ В очереди: **{queued}** — runner заберёт задание в ближайшие секунды.")
+            for jq in queued_jobs:
+                s_at = jq["scheduled_at"]
+                if s_at is not None:
+                    st.markdown(
+                        f"⏰ Задание **#{jq['id']}** `{jq['command']}` — отложено до "
+                        f"**{_fmt_moment(s_at)}** ({_fmt_left(s_at, now_local)})"
+                    )
+                else:
+                    st.markdown(
+                        f"⏳ Задание **#{jq['id']}** `{jq['command']}` — в очереди, "
+                        "runner заберёт в ближайшие секунды"
+                    )
+                qa, qb, qc = st.columns([1, 1, 1.4])
+                if qa.button("▶️ Сейчас", key=f"qnow_{jq['id']}", disabled=s_at is None,
+                             help="Снять отсрочку: runner возьмёт задание немедленно",
+                             use_container_width=True):
+                    _job_action("▶️ Отсрочка снята — задание в очереди",
+                                lambda c, _jid=jq["id"]: jobq.reschedule(c, _jid, None))
+                if qb.button("⏰ +1 ч", key=f"qplus_{jq['id']}",
+                             help="Перенести запуск на час позже (от текущего момента)",
+                             use_container_width=True):
+                    _job_action("⏰ Запуск перенесён на час позже",
+                                lambda c, _jid=jq["id"]: jobq.reschedule(
+                                    c, _jid, datetime.now(_local_tz()) + timedelta(hours=1)))
+                if qc.button("✖ Отменить", key=f"qdel_{jq['id']}",
+                             help="Убрать из очереди, не запуская (в истории: stopped, "
+                                  "«не начато»). Файлы не затрагиваются, слот той же "
+                                  "команды освободится",
+                             use_container_width=True):
+                    _job_action("✖ Задание отменено (не начиналось)",
+                                lambda c, _jid=jq["id"]: jobq.cancel_queued(c, _jid))
         stale_n = int(snap["counts"].get("stale", 0))
         if stale_n:
             st.warning(
@@ -570,46 +753,21 @@ def monitor_fragment(settings: Settings) -> None:
         st.code(_QUICK_CMDS, language="bash")
 
     # --- опасная зона ---
+    # Блок подтверждения переноса относится ТОЛЬКО к manual-режиму: move в auto
+    # переносит все группы последнего run, confirmed не учитывается (move.py),
+    # поэтому в auto он скрыт (1.7.1).
     st.divider()
-    az1, az2 = st.columns(2)
-    with az1:
-        with st.expander("⚠️ Опасная зона: подтверждение переноса (manual)"):
-            _confirm_all_block(lr)
-    with az2:
+    if settings.move.mode == "manual":
+        az1, az2 = st.columns(2)
+        with az1:
+            with st.expander("⚠️ Опасная зона: подтверждение переноса (manual)"):
+                _confirm_all_block(lr)
+        with az2:
+            with st.expander("🧨 Опасная зона: обслуживание БД"):
+                _db_ops_block(settings, locked)
+    else:
         with st.expander("🧨 Опасная зона: обслуживание БД"):
-            st.caption(
-                "Операции выполняются прямо из UI (БД + маунты) и **запрещены, пока движок "
-                "работает**. Файлы в src они не трогают (кроме Undo — он возвращает файлы). "
-                "Для больших архивов предпочтительнее «↩️ Undo» в блоке очереди выше: задание "
-                "выполнит runner (прогресс, история, Стоп), а не спиннер в этой странице."
-            )
-            if _confirm_button(
-                    "clean_db", "💥 Очистить БД", need_confirm=settings.ui.confirm_clean_db,
-                    scope="fragment", disabled=locked, type_="primary",
-                    help="TRUNCATE результатов всех прогонов + журнала. Файлы на диске НЕ трогаются"):
-                with get_pool().connection() as conn:
-                    msg = webops.clean_db(conn)
-                st.toast("БД очищена", icon="💥")
-                st.session_state["op_result"] = msg
-                st.rerun(scope="fragment")
-            if _confirm_button(
-                    "undo_all", "↩️ Отменить всё (undo)", need_confirm=True, scope="fragment",
-                    disabled=locked,
-                    help="Вернуть ВСЕ перенесённые файлы в src, затем очистить результаты "
-                         "и журнал. При проблемах очистка откладывается"):
-                with st.spinner("Возвращаю файлы из trash…"):
-                    with get_pool().connection() as conn:
-                        restored, problems, notes = webops.undo_all(conn, settings, dry=False)
-                if problems:
-                    st.session_state["op_result"] = (
-                        f"Undo: возвращено {restored}, ПРОБЛЕМ: {len(problems)} "
-                        f"(очистка БД отложена): " + " | ".join(problems[:5]))
-                else:
-                    st.session_state["op_result"] = (
-                        f"Undo выполнен: возвращено {restored} файлов, БД очищена"
-                        + ("; " + "; ".join(notes[:3]) if notes else ""))
-                st.toast(f"Undo: возвращено {restored}", icon="↩️")
-                st.rerun(scope="fragment")
+            _db_ops_block(settings, locked)
     op_result = st.session_state.pop("op_result", None)
     if op_result:
         st.info(op_result)
@@ -633,6 +791,43 @@ def _confirm_all_block(lr: dict | None) -> None:
         st.rerun(scope="fragment")
     if b2.button("↩️ Снять все подтверждения", disabled=g["confirmed"] == 0):
         q("UPDATE groups SET confirmed = false WHERE run_id = %s", (lr["id"],), fetch=False)
+        st.rerun(scope="fragment")
+
+
+def _db_ops_block(settings: Settings, locked: bool) -> None:
+    """🧨 Обслуживание БД из UI (Монитор): clean_db + undo_all (общий для обоих режимов)."""
+    st.caption(
+        "Операции выполняются прямо из UI (БД + маунты) и **запрещены, пока движок "
+        "работает**. Файлы в src они не трогают (кроме Undo — он возвращает файлы). "
+        "Для больших архивов предпочтительнее «↩️ Undo» в блоке очереди выше: задание "
+        "выполнит runner (прогресс, история, Стоп), а не спиннер в этой странице."
+    )
+    if _confirm_button(
+            "clean_db", "💥 Очистить БД", need_confirm=settings.ui.confirm_clean_db,
+            scope="fragment", disabled=locked, type_="primary",
+            help="TRUNCATE результатов всех прогонов + журнала. Файлы на диске НЕ трогаются"):
+        with get_pool().connection() as conn:
+            msg = webops.clean_db(conn)
+        st.toast("БД очищена", icon="💥")
+        st.session_state["op_result"] = msg
+        st.rerun(scope="fragment")
+    if _confirm_button(
+            "undo_all", "↩️ Отменить всё (undo)", need_confirm=True, scope="fragment",
+            disabled=locked,
+            help="Вернуть ВСЕ перенесённые файлы в src, затем очистить результаты "
+                 "и журнал. При проблемах очистка откладывается"):
+        with st.spinner("Возвращаю файлы из trash…"):
+            with get_pool().connection() as conn:
+                restored, problems, notes = webops.undo_all(conn, settings, dry=False)
+        if problems:
+            st.session_state["op_result"] = (
+                f"Undo: возвращено {restored}, ПРОБЛЕМ: {len(problems)} "
+                f"(очистка БД отложена): " + " | ".join(problems[:5]))
+        else:
+            st.session_state["op_result"] = (
+                f"Undo выполнен: возвращено {restored} файлов, БД очищена"
+                + ("; " + "; ".join(notes[:3]) if notes else ""))
+        st.toast(f"Undo: возвращено {restored}", icon="↩️")
         st.rerun(scope="fragment")
 
 
@@ -747,9 +942,11 @@ def gallery_tab(settings: Settings, row: dict | None) -> None:
         return
     nav1, nav2, nav3, nav4, _x = st.columns([1, 1, 2, 1, 5])
     if nav4.button("🔄 Обновить", use_container_width=True,
-                   help="Перечитать данные из БД. Автообновление галереи намеренно не "
-                        "включено: при больших архивах (до 3 ТБ) перерисовка миниатюр "
-                        "может быть тяжёлой для браузера."):
+                   help="Перечитать данные из БД. После завершения прогона галерея "
+                        "обновляется сама (фрагмент Монитора видит переход «занят → "
+                        "свободен» и делает одну перерисовку). Постоянного поллинга "
+                        "нет намеренно: при больших архивах (до 3 ТБ) перерисовка "
+                        "миниатюр тяжела для браузера."):
         st.rerun()
 
     st.caption(

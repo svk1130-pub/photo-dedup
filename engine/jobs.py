@@ -7,7 +7,10 @@ LISTEN/NOTIFY для мгновенного пробуждения. Минус �
 точка отказа (решение зафиксировано в docs/WHY_NO_BUTTONS.md §5, вариант A).
 
 Схема использования:
-  * UI/CLI:  enqueue(conn, "run", {...})              → id + NOTIFY канала jobs
+  * UI/CLI:  enqueue(conn, "run", {...}, scheduled_at=None) → id + NOTIFY канала jobs
+             (scheduled_at — Ф3, «не раньше»; None = как можно скорее)
+  * UI:      reschedule(conn, job_id, scheduled_at|None) → перенести отсрочку
+             cancel_queued(conn, job_id)                 → отменить не начатое
   * runner:  claim_next(conn, runner_id)              → dict | None (атомарно)
              heartbeat(conn, job_id, runner_id)       → метка живости ~раз в 5 с
              finish(conn, job_id, state=..., ...)     → итог в историю очереди
@@ -20,6 +23,7 @@ clean-db/undo-dry-run остаются прямыми операциями (CLI/
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import psycopg
@@ -36,12 +40,21 @@ TERMINAL_STATES = ("done", "failed", "stopped", "stale")
 RETAIN_JOBS = 200         # retention истории очереди: хранить последние N завершённых заданий
 
 
-def enqueue(conn: psycopg.Connection, command: str, params: dict[str, Any] | None = None) -> int:
+def enqueue(
+    conn: psycopg.Connection,
+    command: str,
+    params: dict[str, Any] | None = None,
+    *,
+    scheduled_at: datetime | None = None,
+) -> int:
     """Поставить задание в очередь и разбудить runner (pg_notify).
 
     Коммит — у вызывающего (в web — пул соединений, в runner — autocommit).
     Дубликат «живого» задания той же команды отсекает уникальный частичный
     индекс uniq_jobs_queued_command (UniqueViolation у вызывающего).
+    scheduled_at (Ф3, 1.7.0) — «не раньше»: runner не возьмёт задание до срока
+    (фильтр в claim_next); None = выполнить как можно скорее. Передаётся aware
+    datetime — БД хранит абсолютный момент (TIMESTAMPTZ), пояс — дело вызывающего.
     """
     if command not in COMMANDS:
         raise ValueError(
@@ -49,8 +62,8 @@ def enqueue(conn: psycopg.Connection, command: str, params: dict[str, Any] | Non
         )
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO jobs (command, params) VALUES (%s, %s) RETURNING id",
-            (command, Json(params or {})),
+            "INSERT INTO jobs (command, params, scheduled_at) VALUES (%s, %s, %s) RETURNING id",
+            (command, Json(params or {}), scheduled_at),
         )
         # пул web отдаёт dict-строки (dict_row), движок — кортежи: первый
         # столбец извлекается через db.first_value, а не [0] (фикс 1.6.1)
@@ -60,12 +73,14 @@ def enqueue(conn: psycopg.Connection, command: str, params: dict[str, Any] | Non
 
 
 def claim_next(conn: psycopg.Connection, runner_id: str, *, guard_sec: float = GUARD_SEC) -> dict[str, Any] | None:
-    """Атомарно взять следующее задание; None — очередь пуста ИЛИ движок работает.
+    """Атомарно взять следующее ДОСТУПНОЕ задание; None — брать нечего.
 
-    Single-flight guard: свежий рабочий этап в status означает, что выполняется
-    CLI-прогон или другое задание — новое не берём (тот же порог, что и в UI).
-    FOR UPDATE SKIP LOCKED делает взбор безопасным даже при нескольких runner'ах:
-    одна строка достаётся ровно одному. Транзакция короткая (миллисекунды).
+    «Недоступно» — это: (а) очередь пуста, (б) движок уже работает (single-flight
+    guard: свежий рабочий этап в status — выполняется CLI-прогон или задание) и
+    (в) Ф3: задание отложено на будущее (scheduled_at > now() — runner молчит
+    до срока, точность старта ≈ RUNNER_POLL_SEC). FOR UPDATE SKIP LOCKED делает
+    взбор безопасным даже при нескольких runner'ах: одна строка достаётся ровно
+    одному. Транзакция короткая (миллисекунды).
     """
     with conn.transaction():
         with conn.cursor() as cur:
@@ -81,8 +96,10 @@ def claim_next(conn: psycopg.Connection, runner_id: str, *, guard_sec: float = G
                 UPDATE jobs j
                    SET state = 'running', taken_at = now(), heartbeat_at = now(),
                        runner_id = %s
-                  FROM (SELECT id FROM jobs WHERE state = 'queued' ORDER BY id
-                        LIMIT 1 FOR UPDATE SKIP LOCKED) q
+                  FROM (SELECT id FROM jobs
+                         WHERE state = 'queued'
+                           AND (scheduled_at IS NULL OR scheduled_at <= now())
+                         ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED) q
                  WHERE j.id = q.id
                 RETURNING j.id, j.command, j.params
                 """,
@@ -92,6 +109,43 @@ def claim_next(conn: psycopg.Connection, runner_id: str, *, guard_sec: float = G
     if row is None:
         return None
     return {"id": row[0], "command": row[1], "params": row[2] or {}}
+
+
+def reschedule(conn: psycopg.Connection, job_id: int, scheduled_at: datetime | None) -> bool:
+    """Перенести отсрочку queued-задания (Ф3); None = запустить как можно скорее.
+
+    False — задание уже не queued (взято runner'ом/отменено): менять поздно.
+    running намеренно не трогается — остановка выполняемого задания это кнопка
+    Стоп (status.stop_requested), а не правка очереди.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE jobs SET scheduled_at = %s WHERE id = %s AND state = 'queued'",
+            (scheduled_at, job_id),
+        )
+        return cur.rowcount == 1
+
+
+def cancel_queued(conn: psycopg.Connection, job_id: int) -> bool:
+    """Отменить ещё не начатое задание: queued → stopped («не начато», Ф3).
+
+    Задание никогда не выполнялось — файлов это не касается, только строка
+    очереди (в истории: state=stopped, error=«отменено пользователем…»).
+    Слот uniq-индекса освобождается — ту же команду можно поставить снова.
+    False — задание уже не queued (отменять поздно; выполняемое останавливается
+    кнопкой Стоп).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE jobs
+               SET state = 'stopped', finished_at = now(), exit_code = NULL,
+                   error = coalesce(error, 'отменено пользователем (не начато)')
+             WHERE id = %s AND state = 'queued'
+            """,
+            (job_id,),
+        )
+        return cur.rowcount == 1
 
 
 def heartbeat(conn: psycopg.Connection, job_id: int, runner_id: str) -> bool:
@@ -192,9 +246,17 @@ def snapshot(conn: psycopg.Connection) -> dict[str, Any]:
             "FROM jobs WHERE state <> 'queued' ORDER BY id DESC LIMIT 5"
         )
         recent = cur.fetchall()
+        # Ф3: все queued-задания с деталями отсрочки (их ≤ 5 — uniq-индекс,
+        # одна команда = одно queued) — блок «Очередь» Монитора с действиями.
+        cur.execute(
+            "SELECT id, command, scheduled_at, requested_at "
+            "FROM jobs WHERE state = 'queued' ORDER BY id"
+        )
+        queued_jobs = cur.fetchall()
     return {
         "queued": counts.get("queued", 0),
         "counts": counts,
         "running": running,
+        "queued_jobs": queued_jobs,
         "recent": recent,
     }

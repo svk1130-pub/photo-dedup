@@ -20,10 +20,10 @@ services:
       start_period: 5s
 
   # CLI-движок. НЕ автозапускается и не рестартует — используется через:
-  #   docker compose run --rm engine run | scan | analyze | move | undo | status | stop
+  #   docker compose run --rm engine run | scan | analyze | move | undo | status | stop | schedule
   engine:
     build: .
-    image: photo-dedup:1.6.1
+    image: photo-dedup:1.9.0
     init: true
     depends_on:
       db:
@@ -32,6 +32,9 @@ services:
       PG_DSN: postgresql://photo:photo@db:5432/photo
       SETTINGS_PATH: /app/settings.toml
       PHOTOS_ROOT: ${PHOTOS_ROOT:-}   # только информативно (журнал/логи)
+      # 1.9.0: пояс для schedule --at/--delay — момент считается в TZ,
+      # как у пресетов UI и отложенных заданий web/runner
+      TZ: ${TZ:-Europe/Moscow}
     volumes:
       # Где лежат фото НА ХОСТЕ — задаёт ОДНА переменная PHOTOS_ROOT в .env
       # (по умолчанию ./ — папки рядом с docker-compose.yml, как раньше).
@@ -56,7 +59,7 @@ services:
   # CLI `docker compose run --rm engine …` продолжает работать как раньше.
   runner:
     build: .
-    image: photo-dedup:1.6.1
+    image: photo-dedup:1.9.0
     init: true
     restart: unless-stopped
     depends_on:
@@ -71,6 +74,8 @@ services:
       RUNNER_HEARTBEAT_SEC: ${RUNNER_HEARTBEAT_SEC:-5}   # метка живости задания
       RUNNER_STALE_SEC: ${RUNNER_STALE_SEC:-30}      # heartbeat истёк → stale (старт runner'а и UI)
       RUNNER_RETAIN_JOBS: ${RUNNER_RETAIN_JOBS:-200} # retention истории очереди (после finish)
+      # Ф3: пояс для логов runner (сами задания сравниваются в UTC — TIMESTAMPTZ)
+      TZ: ${TZ:-Europe/Moscow}
     volumes:
       - ${PHOTOS_ROOT:-.}/src:/data/src        # rw: shutil.move, как у engine
       - ${PHOTOS_ROOT:-.}/trash:/data/trash    # rw: сюда переносятся дубликаты
@@ -88,7 +93,7 @@ services:
   # Почему нет кнопки «Запустить движок» через docker-сокет — docs/WHY_NO_BUTTONS.md
   web:
     build: .
-    image: photo-dedup:1.6.1
+    image: photo-dedup:1.9.0
     restart: unless-stopped
     depends_on:
       db:
@@ -104,6 +109,9 @@ services:
       PHOTOS_ROOT: ${PHOTOS_ROOT:-}        # для отображения хост-путей в сайдбаре
       RUNNER_STALE_SEC: ${RUNNER_STALE_SEC:-30}   # Ф2: порог stale-детекции из UI (как у runner'а)
       DOCS_DIR: /app/docs
+      # Ф3 (отложенный запуск): в этом поясе считаются пресеты «сегодня/завтра
+      # в 03:00» селекта «Когда запускать» и время отложенных заданий в UI
+      TZ: ${TZ:-Europe/Moscow}
     volumes:
       - ${PHOTOS_ROOT:-.}/src:/data/src        # rw: точечные операции webops (⭐/↩️)
       - ${PHOTOS_ROOT:-.}/trash:/data/trash    # rw: 📋/🗑️/undo из UI

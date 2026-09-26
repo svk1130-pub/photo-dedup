@@ -1,25 +1,30 @@
-"""CLI движка: scan / analyze / move / run / undo / clean-db / status / stop.
+"""CLI движка: scan / analyze / move / run / undo / clean-db / status / stop / schedule.
 
 Приложение запускается как `python -m engine.cli <command>` (или через
 ENTRYPOINT контейнера engine). Никогда не стартует UI; UI никогда не стартует
-движок. CLI-флаги имеют приоритет над settings.toml.
+движок. CLI-флаги имеют приоритет над settings.toml. `schedule` (1.9.0) —
+клиент очереди jobs: INSERT + pg_notify с отсрочкой (--at/--delay), выполняет
+сервис runner — тот же механизм, что у кнопок Монитора в UI (без процессов).
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import os
+import re
 import signal
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import psycopg
 
-from . import db, webops
+from . import db, jobs, webops
 from .analyze import run_analyze
 from .events import EventLog
 from .move import MoveError, run_move
@@ -135,6 +140,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     undo.add_argument("--dry-run", action="store_true", help="только план отмены, без изменений")
 
+    sch = sub.add_parser(
+        "schedule", parents=[common],
+        help="поставить задание в очередь с отсрочкой (--at/--delay); выполнит runner",
+        description="Поставить задание в очередь jobs с отложенным стартом (Ф3): "
+                    "runner возьмёт его не раньше указанного момента. Ровно один "
+                    "из --at/--delay; прошедший момент — ошибка (без молчаливого сдвига).",
+    )
+    sch.add_argument("job", choices=jobs.COMMANDS, metavar="JOB",
+                     help="команда в очередь: run | scan | analyze | move | undo")
+    sch.add_argument("--at", metavar="MOMENT",
+                     help='момент старта: "ГГГГ-ММ-ДД ЧЧ:ММ", "ДД.ММ.ГГГГ ЧЧ:ММ", '
+                          '"ЧЧ:ММ" (сегодня) или дата; прошедший момент — ошибка')
+    sch.add_argument("--delay", metavar="DELAY",
+                     help='отсрочка от текущего момента: "90" (минут), "45m", "2h", "1d", "1d12h"')
+    sch.add_argument("--force", action="store_true", help="для run/scan (см. соответствующую команду)")
+    sch.add_argument("--threads", type=int, metavar="N", help="потоки хэширования (run/scan)")
+    sch.add_argument("--threshold", type=int, metavar="N", help="макс. расстояние Хэмминга (run/analyze)")
+    sch.add_argument("--dry-run", action="store_true", help="только план (run/move/undo)")
+    sch.add_argument("--move-mode", choices=("auto", "manual"), help="auto | manual (run/move)")
+    sch.add_argument("--keep-by", choices=("capture", "size", "pixels"),
+                     help="критерий выбора оригинала (run/move)")
+    sch.add_argument("--group-id", type=int, help="обработать только эту группу (move)")
+
     sub.add_parser(
         "clean-db", parents=[common],
         help="очистить результаты прогонов и журнал (файлы на диске не трогаются)",
@@ -163,6 +191,130 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
 def _settings_path(args: argparse.Namespace) -> str:
     """--settings (в любой позиции) > $SETTINGS_PATH > ./settings.toml"""
     return getattr(args, "settings", None) or os.environ.get("SETTINGS_PATH", "settings.toml")
+
+
+# ----------------------------- планирование (1.9.0) -----------------------------
+
+def _cli_tz() -> Any:
+    """Пояс для интерпретации --at: env TZ (как у web/runner), по умолчанию Europe/Moscow."""
+    try:
+        return ZoneInfo(os.environ.get("TZ") or "Europe/Moscow")
+    except Exception:
+        return datetime.now().astimezone().tzinfo
+
+
+_AT_FORMATS = (
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
+    "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M",
+    "%Y-%m-%d", "%d.%m.%Y",              # дата = 00:00 этого дня
+    "%H:%M:%S", "%H:%M",                 # сегодня; если время уже прошло — ошибка
+)
+
+_DELAY_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "": 60}  # без суффикса — минуты
+
+_TIME_ONLY_FORMATS = ("%H:%M:%S", "%H:%M")  # день берём сегодняшний (strptime даёт 1900-01-01)
+
+
+def _parse_at(spec: str, now: datetime) -> datetime:
+    """Строка --at → aware-момент в поясе `now`. Прошедший момент — ValueError:
+    явная дата не сдвигается молча (та же семантика, что у «Своё время…» UI)."""
+    moment, matched = None, None
+    for fmt in _AT_FORMATS:
+        try:
+            moment = datetime.strptime(spec.strip(), fmt)
+            matched = fmt
+            break
+        except ValueError:
+            continue
+    if moment is None:
+        raise ValueError(
+            f"не удалось разобрать момент {spec!r} — форматы: \"ГГГГ-ММ-ДД ЧЧ:ММ\", "
+            "\"ДД.ММ.ГГГГ ЧЧ:ММ\", \"ЧЧ:ММ\" (сегодня) или просто дата"
+        )
+    if matched in _TIME_ONLY_FORMATS:  # только время → сегодняшний день
+        moment = datetime.combine(now.date(), moment.time())
+    moment = moment.replace(tzinfo=now.tzinfo)
+    if moment <= now:
+        raise ValueError(
+            f"момент {moment:%d.%m.%Y %H:%M} уже в прошлом — укажите будущий момент "
+            "(дата + время) или воспользуйтесь --delay"
+        )
+    return moment
+
+
+def _parse_delay(spec: str, now: datetime) -> datetime:
+    """Строка --delay → aware-момент now + интервал: «90» = 90 минут; сегменты
+    с суффиксами s/m/h/d — «45m», «2h», «1d», «1d12h»."""
+    rest = spec.strip().lower().replace(" ", "")
+    if not rest:
+        raise ValueError("пустая --delay — примеры: 90 (минут), 45m, 2h, 1d, 1d12h")
+    tokens = re.findall(r"(\d+)([smhd]?)", rest)
+    if not tokens or "".join(f"{n}{u}" for n, u in tokens) != rest:
+        raise ValueError(
+            f"не удалось разобрать --delay {spec!r} — примеры: 90 (минут), 45m, 2h, 1d, 1d12h"
+        )
+    total = sum(int(n) * _DELAY_UNITS[u] for n, u in tokens)
+    if total <= 0:
+        raise ValueError("--delay должна быть положительной")
+    return now + timedelta(seconds=total)
+
+
+def _schedule_moment(args: argparse.Namespace) -> datetime:
+    """Ровно один из --at/--delay → момент старта (aware, пояс TZ)."""
+    at_spec = getattr(args, "at", None)
+    delay_spec = getattr(args, "delay", None)
+    if bool(at_spec) == bool(delay_spec):
+        raise ValueError("укажите ровно одно: --at MOMENT (момент старта) или --delay DELAY (отсрочка)")
+    now = datetime.now(_cli_tz())
+    return _parse_at(at_spec, now) if at_spec else _parse_delay(delay_spec, now)
+
+
+def _schedule_params(args: argparse.Namespace) -> dict[str, Any]:
+    """Флаги команды → params задания (та же схема, что читает runner.execute_job)."""
+    params: dict[str, Any] = {}
+    for name in ("threads", "threshold", "move_mode", "keep_by", "group_id"):
+        val = getattr(args, name, None)
+        if val is not None:
+            params[name] = val
+    if getattr(args, "dry_run", False):
+        params["dry_run"] = True
+    if getattr(args, "force", False):
+        params["force"] = True
+    return params
+
+
+def _fmt_in(sec: float) -> str:
+    sec = int(sec)
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    parts = [f"{d} дн"] if d else []
+    if h:
+        parts.append(f"{h} ч")
+    if m and not d:
+        parts.append(f"{m} мин")
+    return "через " + (" ".join(parts) or "<1 мин")
+
+
+def _cmd_schedule(ctx: EngineContext, args: argparse.Namespace, scheduled_at: datetime) -> int:
+    """Постановка отложенного задания в очередь (момент уже валидирован в main).
+
+    Дубликат «живого» задания той же команды отсекает uniq-частичный индекс
+    (одна queued-команда на команду — как у кнопок UI)."""
+    try:
+        job_id = jobs.enqueue(ctx.conn, args.job, _schedule_params(args), scheduled_at=scheduled_at)
+    except psycopg.errors.UniqueViolation:
+        print(
+            f"Задание '{args.job}' уже стоит в очереди (одно queued-задание на команду). "
+            "Отмените или дождитесь текущего — затем повторите.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Задание #{job_id} ({args.job}) поставлено в очередь: старт "
+          f"{scheduled_at:%d.%m.%Y %H:%M} ({_fmt_in((scheduled_at - datetime.now(scheduled_at.tzinfo)).total_seconds())}).")
+    print("Выполнит сервис runner; перенос/отмена — блок «Очередь runner» в UI.")
+    ctx.log.info(f"schedule: задание #{job_id} ({args.job}) в очереди, старт {scheduled_at:%d.%m.%Y %H:%M}")
+    return 0
 
 
 # ----------------------------- сигналы -----------------------------
@@ -337,6 +489,15 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     overrides = _overrides(args)
 
+    # schedule: валидация момента ДО настроек/БД — быстрая ошибка без задержек
+    scheduled_at: datetime | None = None
+    if args.command == "schedule":
+        try:
+            scheduled_at = _schedule_moment(args)
+        except ValueError as e:
+            print(f"Ошибка планирования:\n  {e}", file=sys.stderr)
+            return 2
+
     if args.command in ("status", "stop"):
         return _cmd_light(args)
 
@@ -375,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(settings.paths.trash).expanduser().mkdir(parents=True, exist_ok=True)
     except OSError as e:
         # undo не создаёт trash, но и не требует: папка должна уже существовать
-        if args.command != "undo":
+        if args.command not in ("undo", "schedule"):
             ctx.log.error(f"Не удалось создать папку trash {settings.paths.trash}: {e}")
             return 2
 
@@ -391,6 +552,8 @@ def main(argv: list[str] | None = None) -> int:
             _run_all(ctx, force=args.force)
         elif args.command == "undo":
             _run_undo(ctx, dry=args.dry_run)
+        elif args.command == "schedule":
+            return _cmd_schedule(ctx, args, scheduled_at)
         elif args.command == "clean-db":
             _run_clean_db(ctx)
     except KeyboardInterrupt:
